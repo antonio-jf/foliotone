@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -8,7 +10,7 @@ val baseVersion = rootProject.file("VERSION").readText().trim()
 // Signing key, never in the repository: GitHub Actions passes it through the environment; on a Mac,
 // keystore.properties (made by tools/create-release-key.sh, ignored by git) points to it. With either,
 // debug and release builds share the release key, so Android Studio builds install over releases.
-val keystoreProperties = java.util.Properties().apply {
+val keystoreProperties = Properties().apply {
     rootProject.file("keystore.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) }
 }
 fun signing(env: String, property: String): String? = System.getenv(env) ?: keystoreProperties.getProperty(property)
