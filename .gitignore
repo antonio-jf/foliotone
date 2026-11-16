@@ -1,0 +1,22 @@
+# Build output and IDE state
+.gradle/
+.kotlin/
+.idea/
+build/
+*.apk
+*.aab
+.DS_Store
+__pycache__/
+
+# Machine-specific or secret: never commit
+local.properties
+*.jks
+*.keystore
+.env*
+
+# Local backups (they can contain phone data) and generated listening tests
+backups/
+tts-server/samples/compare/
+tts-server/samples/voxtral/pages/
+tts-server/samples/voxtral/index.html
+tts-server/samples/voxtral/report.json

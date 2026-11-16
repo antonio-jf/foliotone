@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FolioTone · Voice Lab</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#233128;background:#f3f2eb;font-synthesis:none}*{box-sizing:border-box}body{margin:0}main{max-width:940px;margin:64px auto;padding:0 24px}header{display:flex;justify-content:space-between;align-items:center;gap:20px}.brand{font-weight:750;letter-spacing:-.5px}.badge{font-size:12px;background:#e3e9df;padding:8px 12px;border-radius:30px}h1{font-family:Georgia,serif;font-size:clamp(36px,6vw,58px);font-weight:400;letter-spacing:-2px;margin:44px 0 12px}p{color:#637064;line-height:1.6}.intro{max-width:640px;margin-bottom:30px}.card{background:#fffefa;border:1px solid #dedfd3;border-radius:20px;padding:28px;box-shadow:0 8px 35px #23312805}label{display:block;font-size:13px;font-weight:650;margin-bottom:9px}textarea,input,select{width:100%;font:inherit;color:inherit;background:#fffefa;border:1px solid #cdd3c7;border-radius:10px;padding:12px}textarea{resize:vertical;min-height:190px;line-height:1.7}textarea:focus,input:focus,select:focus{outline:2px solid #719579;outline-offset:2px}.row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:24px 0}.hint{font-size:12px;margin:8px 0;color:#6c766c}.count{text-align:right;font-size:12px;color:#758071;margin-top:6px}.actions{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:25px}button,.download{font:inherit;font-weight:600;border-radius:10px;padding:13px 20px;cursor:pointer}button{background:#294f3b;color:white;border:0}button:disabled{opacity:.5;cursor:wait}.secondary{background:#eef0e8;color:#294f3b;font-size:12px;padding:8px 12px}.download{color:#294f3b;background:#e9efe5;text-decoration:none;font-size:13px}.status{font-size:13px;flex:1;min-width:180px;color:#637064}.status.error{color:#a53030}#result{margin-top:26px;border-top:1px solid #e1e4d9;padding-top:20px}audio{width:100%;margin:8px 0 16px}footer{font-size:12px;color:#74806f;margin:24px 2px;line-height:1.8}#metrics{font-size:12px;color:#637064} [hidden]{display:none!important}@media(max-width:600px){main{margin:28px auto}.card{padding:20px}.row{grid-template-columns:1fr}h1{margin-top:32px}header{align-items:start}}
+@media(max-height:850px){main{margin:28px auto}h1{font-size:46px;margin-top:26px}.intro{margin-bottom:20px}.card{padding:24px}textarea{min-height:120px}.row{margin:18px 0}.actions{margin-top:18px}}
+</style>
+</head>
+<body><main>
+<header><div class="brand">FolioTone <span style="font-weight:400;color:#778171">/ Voice Lab</span></div><span class="badge" id="badge">Loading model…</span></header>
+<h1>A voice for every story.</h1>
+<p class="intro">Try Qwen3 narration on your Mac. Paste a passage, choose a voice, and listen to it in your book’s language.</p>
+<form class="card" id="form">
+<label for="text">Your passage</label>
+<textarea id="text" maxlength="1000" required>The morning light slipped through the curtains. Outside, the city was slowly waking, but here, between the pages of a book, time seemed to stand still.</textarea>
+<div class="count"><span id="count">0</span> / 1,000 characters</div>
+<div class="row"><div><label for="language">Language</label><select id="language"></select><p class="hint">Select the language your text is written in.</p></div><div><label for="voice">Narrator</label><select id="voice"></select><p class="hint">All voices support all five languages; accents can vary.</p></div></div>
+<label for="instruction">Delivery instructions <span style="font-weight:400">(optional)</span></label>
+<input id="instruction" maxlength="300" placeholder="Read warmly and calmly, like an audiobook narrator.">
+<div class="actions"><button id="generate" type="submit" disabled>Generate speech</button><button class="secondary" id="sample" type="button">Load language sample</button><span role="status" aria-live="polite" class="status" id="status">Loading Qwen3-TTS into memory…</span></div>
+<section id="result" hidden><label for="audio">Generated narration</label><audio id="audio" aria-label="Generated narration" controls></audio><div class="actions" style="margin-top:0"><a class="download" id="download" download="qwen-speech.wav">Download WAV</a><span id="metrics"></span></div></section>
+</form>
+<footer>Qwen3-TTS · 1.7B CustomVoice · 8-bit · Apple Silicon / MLX<br>Speech is generated on this Mac. Text and audio are kept in memory; download audio to keep it. Short passages work best.</footer>
+</main><script>
+const $=id=>document.getElementById(id);
+const samples={English:'The morning light slipped through the curtains. Outside, the city was slowly waking, but here, between the pages of a book, time seemed to stand still.',Italian:'La luce del mattino filtrava attraverso le tende. Fuori, la città si svegliava lentamente, ma qui, tra le pagine di un libro, il tempo sembrava essersi fermato.',French:'La lumière du matin passait à travers les rideaux. Dehors, la ville se réveillait lentement, mais ici, entre les pages d’un livre, le temps semblait s’être arrêté.',German:'Das Morgenlicht fiel durch die Vorhänge. Draußen erwachte langsam die Stadt, doch hier, zwischen den Seiten eines Buches, schien die Zeit stillzustehen.',Spanish:'La luz de la mañana se filtraba por las cortinas. Afuera, la ciudad despertaba lentamente, pero aquí, entre las páginas de un libro, el tiempo parecía haberse detenido.'};
+let ready = false, busy = false, audioUrl = null, polling = false, lastState = '';
+function message(text, error = false) {
+  $('status').textContent = text;
+  $('status').classList.toggle('error', error);
+}
+function count() { $('count').textContent = $('text').value.length; }
+count();
+$('text').addEventListener('input', count);
+$('sample').onclick = () => {
+  $('text').value = samples[$('language').value] || samples.English;
+  count();
+};
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    const response = await fetch('/api/status');
+    if (!response.ok) throw Error('Server unavailable');
+    const state = await response.json();
+    if (!$('voice').options.length) {
+      state.languages.forEach(language => $('language').add(new Option(language, language)));
+      Object.entries(state.voices).forEach(([voice, description]) => {
+        $('voice').add(new Option(`${voice} — ${description}`, voice));
+      });
+    }
+    ready = state.status === 'ready';
+    $('badge').textContent = state.status === 'error' ? 'Model unavailable'
+      : ready ? (state.busy ? 'Generating locally' : 'Local model ready') : 'Loading model…';
+    $('generate').disabled = !ready || busy || state.busy;
+    const signature = `${state.status}:${state.busy}`;
+    if (!busy && lastState !== signature) {
+      message(state.error || (ready
+        ? (state.busy ? 'Another request is generating audio…' : 'Ready when you are. First generation may take longer.')
+        : 'Loading Qwen3-TTS into memory…'), state.status === 'error');
+    }
+    lastState = signature;
+  } catch (error) {
+    ready = false;
+    lastState = 'disconnected';
+    $('generate').disabled = true;
+    $('badge').textContent = 'Disconnected';
+    if (!busy) message('Cannot reach the server. Start it with ./run.sh.', true);
+  } finally {
+    polling = false;
+  }
+}
+poll();
+setInterval(poll, 3000);
+$('form').onsubmit = async event => {
+  event.preventDefault();
+  if (!ready || busy) return;
+  if (!$('text').value.trim()) {
+    message('Enter some text to read.', true);
+    return;
+  }
+  busy = true;
+  $('generate').disabled = true;
+  $('generate').textContent = 'Generating…';
+  $('audio').pause();
+  message('Generating on your Mac…');
+  const started = Date.now();
+  const timer = setInterval(() => {
+    message(`Generating on your Mac… ${Math.floor((Date.now() - started) / 1000)}s`);
+  }, 1000);
+  try {
+    const response = await fetch('/api/speech', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        text: $('text').value, language: $('language').value,
+        voice: $('voice').value, instruction: $('instruction').value,
+      }),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw Error(typeof error.detail === 'string' ? error.detail : 'Please check the text and selected options.');
+    }
+    const blob = await response.blob();
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    audioUrl = URL.createObjectURL(blob);
+    $('audio').src = audioUrl;
+    $('download').href = audioUrl;
+    $('metrics').textContent = `${response.headers.get('X-Audio-Seconds')}s audio · generated in ${response.headers.get('X-Generation-Seconds')}s`;
+    $('result').hidden = false;
+    message('Your narration is ready. Press play to listen.');
+  } catch (error) {
+    message(error.message || 'Generation failed. Please try again.', true);
+  } finally {
+    clearInterval(timer);
+    busy = false;
+    $('generate').textContent = 'Generate speech';
+    $('generate').disabled = !ready;
+  }
+};
+</script></body></html>
