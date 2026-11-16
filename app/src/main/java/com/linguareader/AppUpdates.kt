@@ -252,10 +252,13 @@ object AppUpdates {
         val scheduler = context.getSystemService(JobScheduler::class.java)
         if (!isAutomatic(context) || isDevelopmentBuild(context)) { scheduler.cancel(JOB_ID); return }
         if (scheduler.getPendingJob(JOB_ID) != null) return
-        scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(context, UpdateCheckJob::class.java))
-            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-            .setPeriodic(CHECK_INTERVAL_MS)
-            .build())
+        // A refused job must never stop the app from opening; checks on open still run.
+        runCatching {
+            scheduler.schedule(JobInfo.Builder(JOB_ID, ComponentName(context, UpdateCheckJob::class.java))
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                .setPeriodic(CHECK_INTERVAL_MS)
+                .build())
+        }
     }
 
     /** One notification per downloaded version; tapping it opens the app's install prompt. */
