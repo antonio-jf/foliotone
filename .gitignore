@@ -10,6 +10,7 @@ __pycache__/
 
 # Machine-specific or secret: never commit
 local.properties
+keystore.properties
 *.jks
 *.keystore
 .env*

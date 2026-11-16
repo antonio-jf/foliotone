@@ -18,25 +18,15 @@ Open the directory in Android Studio, install Android SDK 35, and run the `app` 
 
 Every push to `main`, including merged pull requests, runs [the release workflow](.github/workflows/release.yml). It builds a signed release APK and publishes it as a GitHub release named `v<VERSION>.<run number>`, for example `v1.0.7`. Edit [VERSION](VERSION) to change the first part, such as `1.1`. The run number also becomes the Android `versionCode`, so every release can be installed over the previous one. To check a branch before merging, open **Actions → Release → Run workflow** and pick the branch. That run only builds the APK and attaches it to the run without publishing a release.
 
-Signing uses four repository secrets, set under **Settings → Secrets and variables → Actions**: `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` and `KEY_PASSWORD`. Android installs an update only when it is signed with the same key as the installed app.
+Signing uses FolioTone's own release key, which doesn't depend on Android Studio. Create it once on the Mac:
 
-- **Keep the app you have installed (debug-signed).** Use the Android Studio debug key:
-  ```sh
-  base64 -i ~/.android/debug.keystore | gh secret set KEYSTORE_BASE64 -R antonio-jf/foliotone
-  gh secret set KEYSTORE_PASSWORD -R antonio-jf/foliotone -b android
-  gh secret set KEY_ALIAS -R antonio-jf/foliotone -b androiddebugkey
-  gh secret set KEY_PASSWORD -R antonio-jf/foliotone -b android
-  ```
-  Releases then install over your current app and over builds from Android Studio. Anyone who has that file can sign apps that look like yours, which is acceptable for a private app.
-- **Use a dedicated release key.** This is the better choice if the app will ever be shared more widely:
-  ```sh
-  keytool -genkeypair -v -keystore foliotone-release.jks -alias foliotone -keyalg RSA -keysize 4096 -validity 10000
-  base64 -i foliotone-release.jks | gh secret set KEYSTORE_BASE64 -R antonio-jf/foliotone
-  gh secret set KEYSTORE_PASSWORD -R antonio-jf/foliotone   # prompts for the password
-  gh secret set KEY_ALIAS -R antonio-jf/foliotone -b foliotone
-  gh secret set KEY_PASSWORD -R antonio-jf/foliotone        # same as the store password unless you set another
-  ```
-  Keep the `.jks` file and its password safe outside the repository, because losing them means releases can no longer update the app. The first install over a debug build needs [tools/reinstall-keep-data.sh](tools/reinstall-keep-data.sh). Release builds are not debuggable, so that script, which uses `run-as`, only works from a debug build.
+```sh
+tools/create-release-key.sh
+```
+
+This creates `~/Projects/Signings/foliotone-signing/` with the key (`foliotone-release.jks`), a base64 copy, `keystore.properties` and `README-signing.txt` (passwords, certificate SHA-256 and restore steps). Keep that folder private and backed up: losing it means releases can no longer update the app. The script also copies `keystore.properties` into the project (ignored by git), so Android Studio's debug and release builds use the same key and install over GitHub releases. If the GitHub CLI is signed in, it replaces the four repository secrets the workflow reads (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`). Otherwise, add them under **Settings → Secrets and variables → Actions** from the values in `README-signing.txt`.
+
+Switching an installed app to a new key takes one reinstall. Back up its data first with [tools/reinstall-keep-data.sh](tools/reinstall-keep-data.sh), which needs the installed build to be a debug build. After that, enter the ElevenLabs key and the narration server connection again, because they're encrypted with a device key that Android removes on uninstall.
 
 ## Use
 
