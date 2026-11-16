@@ -180,12 +180,74 @@ class MainActivity : Activity() {
         startService(Intent(this, ReaderService::class.java))
         showHome()
         openMediaBook(intent)
+        AppUpdates.schedule(this)
+        if (!handleUpdateIntent(intent)) checkForUpdateOnOpen()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         openMediaBook(intent)
+        handleUpdateIntent(intent)
+    }
+
+    // ---- App updates from GitHub releases (AppUpdates.kt) ----
+
+    /** Opened from the "update ready" notification: show the install prompt. */
+    private fun handleUpdateIntent(intent: Intent?): Boolean {
+        if (intent?.getBooleanExtra(AppUpdates.EXTRA_INSTALL, false) != true) return false
+        intent.removeExtra(AppUpdates.EXTRA_INSTALL)
+        AppUpdates.readyUpdate(this)?.let { offerUpdate(it) } ?: toast(tr("FolioTone is up to date."))
+        return true
+    }
+
+    private fun checkForUpdateOnOpen() {
+        AppUpdates.readyUpdate(this)?.let { ready ->
+            if (!AppUpdates.wasOffered(this, ready)) offerUpdate(ready)
+            return
+        }
+        if (!AppUpdates.checkIsDue(this)) return
+        worker.execute {
+            val result = AppUpdates.check(this)
+            main.post {
+                if (result is AppUpdates.Result.Downloaded && !isFinishing && !AppUpdates.wasOffered(this, result.ready)) {
+                    offerUpdate(result.ready)
+                }
+            }
+        }
+    }
+
+    private fun checkForUpdatesNow() {
+        toast(tr("Checking for updates…"))
+        worker.execute {
+            val result = AppUpdates.check(this)
+            main.post {
+                when (result) {
+                    is AppUpdates.Result.UpToDate -> toast(tr("FolioTone {0} is up to date.", result.name))
+                    is AppUpdates.Result.Downloaded -> {
+                        if (inSettings) showSettings()
+                        offerUpdate(result.ready)
+                    }
+                    is AppUpdates.Result.Failed -> toast(tr("Could not check for updates: {0}", result.message))
+                }
+            }
+        }
+    }
+
+    private fun offerUpdate(ready: AppUpdates.Ready) {
+        AppUpdates.markOffered(this, ready)
+        choiceSheet(tr("FolioTone {0} is ready", ready.name), listOf(
+            MenuChoice(tr("Install now"), tr("FolioTone closes and opens again on the new version. Books, progress and downloaded narration stay.")),
+            MenuChoice(tr("Later"), tr("Install it anytime from Listening settings → App updates."))
+        )) { if (it == 0) installUpdate(ready) }
+    }
+
+    private fun installUpdate(ready: AppUpdates.Ready) {
+        val started = runCatching { AppUpdates.install(this, ready) }
+        when {
+            started.isFailure -> toast(tr("Update not installed: {0}", started.exceptionOrNull()?.message ?: ""))
+            started.getOrNull() == false -> toast(tr("Allow FolioTone to install apps, then tap Install again."))
+        }
     }
 
     private fun openMediaBook(intent: Intent?) {
@@ -1248,6 +1310,19 @@ class MainActivity : Activity() {
             store.contextResume) { store.contextResume = it }
         switchRow(reading, tr("Automatically mark finished books as read"),
             tr("When narration finishes or you go past the last page"), store.autoMarkRead) { store.autoMarkRead = it }
+
+        val updates = settingsGroup(tr("App updates"))
+        val ready = AppUpdates.readyUpdate(this)
+        settingRow(updates, tr("Version {0}", AppUpdates.installedName(this)),
+            if (ready != null) tr("Version {0} is downloaded and ready") else tr("Tap to check for updates")) {
+            checkForUpdatesNow()
+        }
+        if (ready != null) settingRow(updates, tr("Install version {0}", ready.name),
+            tr("FolioTone closes and opens again on the new version.")) { installUpdate(ready) }
+        switchRow(updates, tr("Download updates automatically"),
+            if (AppUpdates.isDevelopmentBuild(this)) tr("Off for builds from Android Studio; you can still check by hand.")
+            else tr("Checks GitHub twice a day; you confirm each install."),
+            AppUpdates.isAutomatic(this)) { AppUpdates.setAutomatic(this, it) }
 
         val storage = settingsGroup(tr("Storage"))
         val storageValue = settingRow(storage, tr("Delete all downloaded narration"), tr("Checking saved audio…"),
