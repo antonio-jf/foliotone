@@ -120,6 +120,13 @@ Original versions of the modified files are in `backups/before-server-narration/
 - New UI text: wrap it as `tr("Text with {0}", value)` — a plain literal, not a `$` template — then run `python3 tools/i18n/check_translations.py` (add `--add` to append English placeholders to es.json) and translate the new entries. Adding a language = new `assets/i18n/<code>.json` plus an entry in `I18n.LANGUAGES`.
 - Pre-i18n sources are in `backups/before-i18n/`.
 
+## App updates from GitHub (branch auto-update, 2026-11-15)
+
+- `AppUpdates.kt`: `AppUpdates` (GitHub `releases/latest`, versionCode = last number of the tag `v<VERSION>.<run number>`, download to `filesDir/updates`, SHA-256 check against `SHA256SUMS.txt`, signer check, `PackageInstaller` session with `USER_ACTION_NOT_REQUIRED` on API 31+), `UpdateCheckJob` (JobScheduler, every 12 h, any network) and `UpdateInstallReceiver` (starts the system confirmation or toasts the failure). State lives in the `app_updates` SharedPreferences: `automatic`, `lastCheck`, `ready*`, `notifiedCode`, `offeredCode`.
+- MainActivity: schedules the job and checks on open (`checkForUpdateOnOpen`, at most every 6 h), handles the notification extra `installUpdate`, and shows the "App updates" settings group.
+- Manifest: `REQUEST_INSTALL_PACKAGES`, the job service and the receiver.
+- Debuggable builds never check automatically (`isDevelopmentBuild`).
+
 ## Data and progress semantics
 
 `BookStore` is a process-wide singleton using the application context. Each `Book` stores ID, title, author, language, zero-based section/page indices, section count, page count for the saved section, and optional Gutenberg ID.

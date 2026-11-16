@@ -4,6 +4,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <queries>
         <intent>
@@ -25,6 +26,8 @@
         </service>
         <service android:name=".OfflineDownloadService" android:exported="false" android:foregroundServiceType="dataSync" />
         <service android:name=".GutenbergDownloadService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name=".UpdateCheckJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <receiver android:name=".UpdateInstallReceiver" android:exported="false" />
         <meta-data android:name="com.google.android.gms.car.application" android:resource="@xml/automotive_app_desc" />
     </application>
 </manifest>
