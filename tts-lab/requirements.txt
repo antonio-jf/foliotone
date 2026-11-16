@@ -1,0 +1,4 @@
+mlx-audio
+fastapi
+uvicorn
+soundfile
