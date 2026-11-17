@@ -466,9 +466,23 @@ class MainActivity : Activity() {
         }
         list.setSelection(AppThemes.all.indexOf(palette))
     }
-    private fun progress(book: Book): Int = if (book.sectionCount <= 0) 0 else
-        if (store.isRead(book.id)) 100 else (((book.section + book.page.toFloat() / book.pagesInSection.coerceAtLeast(1)) / book.sectionCount) * 100)
+    /**
+     * Percent of the book read, counted in pages: sections can differ hugely in length, so counting
+     * each section as an equal share is badly off. Books not opened since this was added only know the
+     * current section's size and fall back to that estimate until they are opened once.
+     */
+    private fun progress(book: Book): Int {
+        if (store.isRead(book.id)) return 100
+        if (book.sectionCount <= 0) return 0
+        val pages = book.sectionPages
+        val total = pages.sum()
+        if (pages.size == book.sectionCount && total > 0) {
+            val read = pages.take(book.section.coerceIn(0, pages.size)).sum() + book.page
+            return (read * 100L / total).toInt().coerceIn(0, 100)
+        }
+        return (((book.section + book.page.toFloat() / book.pagesInSection.coerceAtLeast(1)) / book.sectionCount) * 100)
             .toInt().coerceIn(0, 100)
+    }
     private fun progressBar(value: Int) = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
         max = 100; progress = value
         progressTintList = android.content.res.ColorStateList.valueOf(accent)
@@ -2011,6 +2025,7 @@ class MainActivity : Activity() {
                         else store.edit(book.id) {
                             it.sectionCount = parsed.sections.size
                             it.pagesInSection = parsed.sections.getOrNull(it.section)?.pages?.size ?: 0
+                            it.sectionPages = parsed.sections.map { section -> section.pages.size }
                         }) ?: book
                     // Reopening the book that is playing keeps its place instead of rewinding and stopping.
                     val alreadyPlaying = playing && serviceBookId == book.id
@@ -2039,7 +2054,8 @@ class MainActivity : Activity() {
             section = sectionIndex,
             page = pageIndex,
             sectionCount = parsed.sections.size,
-            pagesInSection = section.pages.size
+            pagesInSection = section.pages.size,
+            sectionPages = parsed.sections.map { it.pages.size }
         ))
         content.removeAllViews()
         content.addView(rowOf(compact(secondary(tr("←  Library")) { selectedId = null; showHome() }, 38),

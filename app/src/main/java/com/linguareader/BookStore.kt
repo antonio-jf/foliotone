@@ -31,7 +31,9 @@ data class Book(
     var page: Int = 0,
     var sectionCount: Int = 0,
     var pagesInSection: Int = 0,
-    var gutenbergId: Int? = null
+    var gutenbergId: Int? = null,
+    /** Pages in each section, so progress can be measured in pages across the whole book. */
+    var sectionPages: List<Int> = emptyList()
 )
 
 /** EPUBs are copied into private app storage; only metadata and progress are kept in JSON. */
@@ -209,7 +211,8 @@ class BookStore private constructor(private val context: Context) {
                 Book(o.getString("id"), o.getString("title"), o.optString("author"),
                     o.optString("language"), o.optInt("section"), o.optInt("page"),
                     o.optInt("sectionCount"), o.optInt("pagesInSection"),
-                    if (o.has("gutenbergId") && !o.isNull("gutenbergId")) o.optInt("gutenbergId") else null)
+                    if (o.has("gutenbergId") && !o.isNull("gutenbergId")) o.optInt("gutenbergId") else null,
+                    o.optJSONArray("sectionPages")?.let { pages -> (0 until pages.length()).map { pages.optInt(it) } }.orEmpty())
             }.getOrNull()
         }.filter { File(root, "${it.id}.epub").exists() }
     }
@@ -221,6 +224,7 @@ class BookStore private constructor(private val context: Context) {
             put("language", b.language); put("section", b.section); put("page", b.page)
             put("sectionCount", b.sectionCount); put("pagesInSection", b.pagesInSection)
             b.gutenbergId?.let { put("gutenbergId", it) }
+            if (b.sectionPages.isNotEmpty()) put("sectionPages", JSONArray(b.sectionPages))
         }) }
         val temp = File(context.filesDir, "library.json.tmp")
         temp.writeText(data.toString())
@@ -320,7 +324,7 @@ class BookStore private constructor(private val context: Context) {
                     }
                 val book = Book(id, parsed.title, parsed.author, parsed.language,
                     sectionCount = parsed.sections.size, pagesInSection = parsed.sections.first().pages.size,
-                    gutenbergId = gutenbergId)
+                    gutenbergId = gutenbergId, sectionPages = parsed.sections.map { it.pages.size })
                 require(staged.renameTo(file(book))) { tr("Cannot save the book") }
                 try {
                     save(books() + book)
