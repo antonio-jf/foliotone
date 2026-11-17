@@ -659,6 +659,7 @@ class ReaderService : MediaBrowserService() {
         sectionFinished = false
         book.sectionCount = sections.size
         book.pagesInSection = sections.getOrNull(book.section)?.pages?.size ?: 0
+        book.sectionPages = sections.map { it.pages.size }
         store.update(book)
     }
 
