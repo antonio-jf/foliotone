@@ -1351,10 +1351,36 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Installed speech engines as (package, label). TextToSpeech.getEngines() only returns engines whose
+     * service declares the DEFAULT category, which leaves out some (Samsung's on some phones), so the
+     * services are also queried directly and the phone's default engine is always included.
+     */
+    private fun speechEngines(tts: TextToSpeech?): List<Pair<String, String>> {
+        val found = linkedMapOf<String, String>()
+        tts?.engines.orEmpty().forEach { found[it.name] = it.label?.toString().orEmpty().ifBlank { it.name } }
+        runCatching {
+            @Suppress("DEPRECATION")
+            packageManager.queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0)
+        }.getOrDefault(emptyList()).forEach { info ->
+            val name = info.serviceInfo?.packageName ?: return@forEach
+            if (name != packageName) found.getOrPut(name) { info.loadLabel(packageManager).toString().ifBlank { name } }
+        }
+        tts?.defaultEngine?.takeIf { it.isNotBlank() && it !in found }?.let { name ->
+            found[name] = runCatching {
+                packageManager.getApplicationLabel(packageManager.getApplicationInfo(name, 0)).toString()
+            }.getOrDefault(name)
+        }
+        return found.toList()
+    }
+
     private fun showDeviceVoiceSettings(card: LinearLayout) {
         val engine = store.speechEngine
-        val provider = previewTts?.engines?.firstOrNull { it.name == engine }?.label?.toString()
-            ?: if (engine == null) tr("System default") else tr("Unavailable provider")
+        val engines = speechEngines(previewTts)
+        val defaultLabel = previewTts?.defaultEngine?.let { name -> engines.firstOrNull { it.first == name }?.second }
+        val provider = engines.firstOrNull { it.first == engine }?.second
+            ?: if (engine == null) defaultLabel?.let { tr("System default · {0}", it) } ?: tr("System default")
+            else tr("Unavailable provider")
         settingRow(card, tr("Speech provider"), provider) { chooseEngine() }
         settingRow(card, tr("Language"), languageName(settingsLanguage)) { chooseSettingsLanguage() }
         val voices = if (previewReady) previewTts?.let { NarrationVoices.available(it, settingsLanguage) }.orEmpty()
@@ -1975,12 +2001,12 @@ class MainActivity : Activity() {
     private fun chooseEngine() {
         val tts = previewTts
         if (!previewReady || tts == null) { toast(tr("Speech providers are loading. Try again in a moment.")); return }
-        val engines = tts.engines.orEmpty()
+        val engines = speechEngines(tts)
         val choices = listOf(MenuChoice(tr("System default"), tr("Use Android's selected speech provider"))) +
-            engines.map { MenuChoice(it.label?.toString().orEmpty().ifBlank { it.name }, it.name) }
-        val current = engines.indexOfFirst { it.name == store.speechEngine }
+            engines.map { (name, label) -> MenuChoice(label, name) }
+        val current = engines.indexOfFirst { it.first == store.speechEngine }
         choiceSheet(tr("Speech provider"), choices, current + 1) { index ->
-            store.speechEngine = if (index == 0) null else engines[index - 1].name
+            store.speechEngine = if (index == 0) null else engines[index - 1].first
             startPreviewTts()
             command("ENGINE_CHANGED")
             showSettings()
