@@ -53,7 +53,7 @@ class MainActivity : Activity() {
     private lateinit var store: BookStore
     private lateinit var scroll: ScrollView
     private lateinit var content: LinearLayout
-    private var previewTts: TextToSpeech? = null
+    private var previewTts: Speech? = null
     private lateinit var previewAudioFocus: PlaybackAudioFocus
     private var previewUtterance: String? = null
     private var previewSequence = 0
@@ -305,7 +305,7 @@ class MainActivity : Activity() {
         previewReady = false
         stopVoicePreview()
         previewTts?.shutdown()
-        val listener = TextToSpeech.OnInitListener { status ->
+        previewTts = Speech.create(this, store.speechEngine) { status ->
             main.post {
                 if (epoch == previewEpoch) {
                     if (status != TextToSpeech.SUCCESS && store.speechEngine != null) {
@@ -327,9 +327,6 @@ class MainActivity : Activity() {
                 }
             }
         }
-        val engine = store.speechEngine
-        previewTts = if (engine == null) TextToSpeech(this, listener)
-            else TextToSpeech(this, listener, engine)
     }
 
     private fun refreshVoices() {
@@ -1356,9 +1353,8 @@ class MainActivity : Activity() {
      * service declares the DEFAULT category, which leaves out some (Samsung's on some phones), so the
      * services are also queried directly and the phone's default engine is always included.
      */
-    private fun speechEngines(tts: TextToSpeech?): List<Pair<String, String>> {
+    private fun speechEngines(): List<Pair<String, String>> {
         val found = linkedMapOf<String, String>()
-        tts?.engines.orEmpty().forEach { found[it.name] = it.label?.toString().orEmpty().ifBlank { it.name } }
         runCatching {
             @Suppress("DEPRECATION")
             packageManager.queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0)
@@ -1366,7 +1362,7 @@ class MainActivity : Activity() {
             val name = info.serviceInfo?.packageName ?: return@forEach
             if (name != packageName) found.getOrPut(name) { info.loadLabel(packageManager).toString().ifBlank { name } }
         }
-        tts?.defaultEngine?.takeIf { it.isNotBlank() && it !in found }?.let { name ->
+        Speech.defaultEngine(this)?.takeIf { it !in found }?.let { name ->
             found[name] = runCatching {
                 packageManager.getApplicationLabel(packageManager.getApplicationInfo(name, 0)).toString()
             }.getOrDefault(name)
@@ -1376,8 +1372,8 @@ class MainActivity : Activity() {
 
     private fun showDeviceVoiceSettings(card: LinearLayout) {
         val engine = store.speechEngine
-        val engines = speechEngines(previewTts)
-        val defaultLabel = previewTts?.defaultEngine?.let { name -> engines.firstOrNull { it.first == name }?.second }
+        val engines = speechEngines()
+        val defaultLabel = Speech.defaultEngine(this)?.let { name -> engines.firstOrNull { it.first == name }?.second }
         val provider = engines.firstOrNull { it.first == engine }?.second
             ?: if (engine == null) defaultLabel?.let { tr("System default · {0}", it) } ?: tr("System default")
             else tr("Unavailable provider")
@@ -2001,7 +1997,7 @@ class MainActivity : Activity() {
     private fun chooseEngine() {
         val tts = previewTts
         if (!previewReady || tts == null) { toast(tr("Speech providers are loading. Try again in a moment.")); return }
-        val engines = speechEngines(tts)
+        val engines = speechEngines()
         val choices = listOf(MenuChoice(tr("System default"), tr("Use Android's selected speech provider"))) +
             engines.map { (name, label) -> MenuChoice(label, name) }
         val current = engines.indexOfFirst { it.first == store.speechEngine }

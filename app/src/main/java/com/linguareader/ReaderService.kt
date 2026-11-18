@@ -40,7 +40,7 @@ class ReaderService : MediaBrowserService() {
 
     private lateinit var store: BookStore
     private lateinit var session: MediaSession
-    private lateinit var tts: TextToSpeech
+    private lateinit var tts: Speech
     private lateinit var audioFocus: PlaybackAudioFocus
     private val main = Handler(Looper.getMainLooper())
     private val browseWorker = Executors.newSingleThreadExecutor()
@@ -141,12 +141,9 @@ class ReaderService : MediaBrowserService() {
             if (store.narrationSource == "device") generation++
             tts.stop(); tts.shutdown()
         }
-        val listener = TextToSpeech.OnInitListener { status ->
+        tts = Speech.create(this, store.speechEngine) { status ->
             main.post { if (epoch == ttsEpoch) onTtsReady(status) }
         }
-        val engine = store.speechEngine
-        tts = if (engine == null) TextToSpeech(this, listener)
-            else TextToSpeech(this, listener, engine)
     }
 
     private fun onTtsReady(status: Int) {

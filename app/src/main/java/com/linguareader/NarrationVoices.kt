@@ -14,7 +14,7 @@ object NarrationVoices {
         else -> Locale.ENGLISH
     }
 
-    fun available(tts: TextToSpeech, language: String): List<Voice> =
+    fun available(tts: Speech, language: String): List<Voice> =
         (tts.voices ?: emptySet()).filter { voice ->
             voice.locale.language == language &&
                 TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED !in voice.features.orEmpty()
@@ -24,7 +24,7 @@ object NarrationVoices {
             .thenBy { it.latency }
             .thenBy { it.name })
 
-    fun choose(tts: TextToSpeech, language: String, preferred: String?, allowNetwork: Boolean = true): Voice? {
+    fun choose(tts: Speech, language: String, preferred: String?, allowNetwork: Boolean = true): Voice? {
         val voices = available(tts, language).filter { allowNetwork || !it.isNetworkConnectionRequired }
         return voices.firstOrNull { it.name == preferred } ?: voices.firstOrNull()
     }
