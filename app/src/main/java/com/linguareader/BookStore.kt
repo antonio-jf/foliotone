@@ -59,6 +59,11 @@ class BookStore private constructor(private val context: Context) {
         get() = prefs.getBoolean("context_resume", true)
         set(value) { prefs.edit().putBoolean("context_resume", value).apply() }
 
+    /** Device voices: render upcoming sentences to audio ahead of playback (RenderAhead). */
+    var renderAhead: Boolean
+        get() = prefs.getBoolean("render_ahead", true)
+        set(value) { prefs.edit().putBoolean("render_ahead", value).apply() }
+
     var autoMarkRead: Boolean
         get() = prefs.getBoolean("auto_mark_read", true)
         set(value) { prefs.edit().putBoolean("auto_mark_read", value).apply() }

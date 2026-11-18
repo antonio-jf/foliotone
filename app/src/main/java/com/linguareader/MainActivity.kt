@@ -1371,6 +1371,12 @@ class MainActivity : Activity() {
         settingRow(card, tr("Voice"), voiceStatus) { chooseVoice(settingsLanguage) }
         settingRow(card, tr("Refresh downloaded voices")) { refreshVoices() }
         settingRow(card, tr("Download more voices"), chevron = false) { installVoices() }
+        switchRow(card, tr("Gapless playback"),
+            tr("Prepares the next sentences and page in advance, so voices like SherpaTTS read without pauses."),
+            store.renderAhead) {
+            store.renderAhead = it
+            command("VOICE_CHANGED")
+        }
     }
 
     private fun showElevenSettings(card: LinearLayout) {

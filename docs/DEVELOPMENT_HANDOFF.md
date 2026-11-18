@@ -127,6 +127,13 @@ Original versions of the modified files are in `backups/before-server-narration/
 - Manifest: `REQUEST_INSTALL_PACKAGES`, the job service and the receiver.
 - Debuggable builds never check automatically (`isDevelopmentBuild`).
 
+## Gapless device voices (RenderAhead, 2026-11-17)
+
+- When TextToSpeech plays an engine itself, Android lets synthesis run only about 0.5 s ahead of playback. Engines that render a whole sentence before returning any audio (SherpaTTS/Piper) therefore pause before every sentence and page.
+- `RenderAhead.kt`: one thread calls `synthesizeToFile` for pieces of whole sentences: the first piece about 160 characters, so playback starts quickly, then about 350 each, across pages, up to 12 pieces ahead. A second thread streams the WAVs (16-bit PCM) into one `AudioTrack` with a 140 ms gap. A main-thread monitor turns the playback head position into `onChunkStarted` events (page moves, progress), then `onFinished` at the end of the book.
+- `ReaderService`: `speakDevice` uses it unless reading a single fallback page for the server source. TextToSpeech callbacks for ids starting with `render:` go to `rendered()`. A brief audio-focus loss pauses the `AudioTrack` and resumes it. Pause keeps the current piece in `resumeAt`. Any failure sets `renderFailed` for the session (cleared on voice or engine change) and falls back to normal `tts.speak` playback.
+- Preference `render_ahead` (default on) is the "Gapless playback" switch in the device-voice settings.
+
 ## Data and progress semantics
 
 `BookStore` is a process-wide singleton using the application context. Each `Book` stores ID, title, author, language, zero-based section/page indices, section count, page count for the saved section, and optional Gutenberg ID.
