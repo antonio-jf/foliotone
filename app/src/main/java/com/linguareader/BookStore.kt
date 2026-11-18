@@ -51,6 +51,7 @@ class BookStore private constructor(private val context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     init {
+        SpeechText.setPronunciations(pronunciations())
         root.listFiles()?.filter { it.name.startsWith("import-") && it.name.endsWith(".epub") }
             ?.forEach(File::delete)
     }
@@ -144,6 +145,36 @@ class BookStore private constructor(private val context: Context) {
     fun speechRateFor(bookId: String?): Float {
         val own = bookId?.let { "speech_rate_$it" }?.takeIf { prefs.contains(it) }
         return prefs.getFloat(own ?: "speech_rate", 0.94f).coerceIn(0.75f, 1.2f)
+    }
+
+    /** Pronunciation fixes for device voices: (as written, as spoken). */
+    fun pronunciations(): List<Pair<String, String>> = runCatching {
+        val array = JSONArray(prefs.getString("pronunciations", "[]"))
+        (0 until array.length()).map { array.getJSONObject(it) }.map { it.optString("written") to it.optString("spoken") }
+    }.getOrDefault(emptyList())
+
+    fun savePronunciations(rules: List<Pair<String, String>>) {
+        val array = JSONArray()
+        rules.forEach { (written, spoken) -> array.put(JSONObject().put("written", written).put("spoken", spoken)) }
+        prefs.edit().putString("pronunciations", array.toString()).apply()
+        SpeechText.setPronunciations(rules)
+    }
+
+    /** A sentence the user marked as read wrongly: the page text, what the voice was given, and where. */
+    data class Report(val text: String, val spoken: String, val book: String, val engine: String, val created: Long)
+
+    fun reports(): List<Report> = runCatching {
+        val array = JSONArray(prefs.getString("reports", "[]"))
+        (0 until array.length()).map { array.getJSONObject(it) }.map {
+            Report(it.optString("text"), it.optString("spoken"), it.optString("book"), it.optString("engine"), it.optLong("created"))
+        }
+    }.getOrDefault(emptyList())
+
+    fun saveReports(reports: List<Report>) {
+        val array = JSONArray()
+        reports.takeLast(100).forEach { array.put(JSONObject().put("text", it.text).put("spoken", it.spoken)
+            .put("book", it.book).put("engine", it.engine).put("created", it.created)) }
+        prefs.edit().putString("reports", array.toString()).apply()
     }
 
     /** Reading page text size (sp) and extra line spacing (dp). */
@@ -413,6 +444,11 @@ class BookStore private constructor(private val context: Context) {
     }
 
     fun importSettings(settings: JSONObject) {
+        restoreSettings(settings)
+        SpeechText.setPronunciations(pronunciations())
+    }
+
+    private fun restoreSettings(settings: JSONObject) {
         val editor = prefs.edit()
         settings.keys().forEach { key ->
             val typed = settings.optJSONObject(key) ?: return@forEach

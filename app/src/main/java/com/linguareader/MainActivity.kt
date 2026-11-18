@@ -1486,6 +1486,11 @@ class MainActivity : Activity() {
         settingRow(card, tr("Voice"), voiceStatus) { chooseVoice(settingsLanguage) }
         settingRow(card, tr("Refresh downloaded voices")) { refreshVoices() }
         settingRow(card, tr("Download more voices"), chevron = false) { installVoices() }
+        val fixes = store.pronunciations().size
+        settingRow(card, tr("Pronunciations"), if (fixes == 0) tr("Teach the voice how to say a word")
+            else tr("{0} words", fixes)) { managePronunciations() }
+        val reports = store.reports().size
+        if (reports > 0) settingRow(card, tr("Reported sentences"), tr("{0} saved for review", reports)) { manageReports() }
         switchRow(card, tr("Gapless playback"),
             tr("Prepares the next sentences and page in advance, so voices like SherpaTTS read without pauses."),
             store.renderAhead) {
@@ -2680,6 +2685,8 @@ class MainActivity : Activity() {
             else -> tr("Off")
         }) to { chooseSleep() }
         actions += MenuChoice(tr("Add bookmark"), tr("Saves the sentence being read")) to { command("BOOKMARK") }
+        if (store.replayUseful(this)) actions += MenuChoice(tr("Report a garbled sentence"),
+            tr("Saves the last sentence so it can be fixed")) to { command("REPORT") }
         val marks = store.bookmarks(book.id)
         if (marks.isNotEmpty()) actions += MenuChoice(tr("Bookmarks"), tr("{0} saved", marks.size)) to { showBookmarks(book) }
         if (cloud) actions += MenuChoice(tr("Regenerate this page"),
@@ -2688,6 +2695,115 @@ class MainActivity : Activity() {
             settingsLanguage = book.language.ifBlank { "en" }; showSettings()
         }
         choiceSheet(tr("Listening options"), actions.map { it.first }) { actions[it].second() }
+    }
+
+    private fun managePronunciations() {
+        val rules = store.pronunciations()
+        val choices = listOf(MenuChoice(tr("＋  Add a word"), tr("For phone voices: how a word is written and how to say it"))) +
+            rules.map { (written, spoken) -> MenuChoice(written, tr("said as “{0}”", spoken)) }
+        choiceSheet(tr("Pronunciations"), choices) { index ->
+            if (index == 0) { editPronunciation(null, ""); return@choiceSheet }
+            val rule = rules[index - 1]
+            choiceSheet(rule.first, listOf(MenuChoice(tr("Listen")), MenuChoice(tr("Edit")), MenuChoice(tr("Delete")))) { action ->
+                when (action) {
+                    0 -> sayAloud(rule.second)
+                    1 -> editPronunciation(rule, rule.first)
+                    else -> { store.savePronunciations(rules - rule); command("VOICE_CHANGED"); showSettings() }
+                }
+            }
+        }
+    }
+
+    /** Add or change a pronunciation; [written] pre-fills the word (from a reported sentence). */
+    private fun editPronunciation(existing: Pair<String, String>?, written: String) {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(24), dp(22), dp(24))
+            background = rounded(surface, 22)
+        }
+        panel.addView(text(tr("Pronunciation"), 22f).apply { typeface = Typeface.SERIF })
+        panel.addView(text(tr("Write the word as it appears in books, then spell it the way it should sound. Applies to phone voices."), 13f, muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        fun field(hint: String, value: String) = EditText(this).apply {
+            this.hint = hint
+            setText(value)
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(ink); setHintTextColor(muted)
+            textSize = 15f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(surfaceRaised, 12)
+        }
+        val writtenField = field(tr("As written, e.g. Kordestani"), existing?.first ?: written)
+        val spokenField = field(tr("Say it as, e.g. Kor-des-tah-nee"), existing?.second ?: "")
+        panel.addView(writtenField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        panel.addView(spokenField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        panel.addView(rowOf(secondary(tr("Listen")) { sayAloud(spokenField.text.toString()) },
+            button(tr("Save")) {
+                val from = writtenField.text.toString().trim()
+                val to = spokenField.text.toString().trim()
+                if (from.isEmpty() || to.isEmpty()) { toast(tr("Fill in both fields")); return@button }
+                val rules = store.pronunciations().filterNot { it == existing || it.first.equals(from, true) } + (from to to)
+                store.savePronunciations(rules)
+                command("VOICE_CHANGED")
+                dialog.dismiss()
+                toast(tr("Saved: “{0}” is now said as “{1}”", from, to))
+                if (inSettings) showSettings()
+            }), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        dialog.setContentView(panel)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.9).toInt(), -2)
+        dialog.setOnDismissListener { stopVoicePreview() }
+        dialog.show()
+    }
+
+    /** Says [text] with the phone voice chosen for the settings language (pronunciation test). */
+    private fun sayAloud(text: String) {
+        val tts = previewTts
+        if (text.isBlank()) return
+        if (tts == null || !previewReady) { toast(tr("Loading voices…")); return }
+        stopVoicePreview()
+        if (playing) command("PAUSE")
+        if (!previewAudioFocus.acquire()) { toast(tr("Audio is in use by another app. Try again shortly.")); return }
+        val id = "voice-preview-${++previewSequence}"
+        previewUtterance = id
+        tts.setAudioAttributes(PlaybackAudioFocus.attributes)
+        NarrationVoices.choose(tts, settingsLanguage, store.voiceName(settingsLanguage))?.let { tts.setVoice(it) }
+        tts.setSpeechRate(store.speechRate)
+        if (tts.speak(SpeechText.normalize(text, settingsLanguage), TextToSpeech.QUEUE_FLUSH, null, id) != TextToSpeech.SUCCESS) stopVoicePreview()
+    }
+
+    private fun manageReports() {
+        val reports = store.reports().reversed()
+        if (reports.isEmpty()) { toast(tr("No reported sentences")); return }
+        val choices = listOf(MenuChoice(tr("Share all"), tr("Send the list, e.g. to look at the text together")),
+            MenuChoice(tr("Clear the list"))) +
+            reports.map { MenuChoice(it.text.take(120), tr("{0} · {1}", it.book, it.engine)) }
+        choiceSheet(tr("Reported sentences"), choices) { index ->
+            when (index) {
+                0 -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(Intent.EXTRA_SUBJECT, tr("FolioTone: sentences read wrongly"))
+                    .putExtra(Intent.EXTRA_TEXT, reports.joinToString("\n\n") {
+                        "${it.book} (${it.engine})\n" + tr("Page text: {0}", it.text) + "\n" + tr("Given to the voice: {0}", it.spoken)
+                    }), tr("Share")))
+                1 -> confirm(tr("Clear all reported sentences?"), tr("Clear")) {
+                    store.saveReports(emptyList()); if (inSettings) showSettings()
+                }
+                else -> {
+                    val report = reports[index - 2]
+                    choiceSheet(report.text.take(80), listOf(MenuChoice(tr("Fix a word's pronunciation")),
+                        MenuChoice(tr("Listen to it again")), MenuChoice(tr("Delete")))) { action ->
+                        when (action) {
+                            0 -> editPronunciation(null, "")
+                            1 -> sayAloud(report.text)
+                            else -> { store.saveReports(store.reports() - report); if (inSettings) showSettings() }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun chooseSleep() {
