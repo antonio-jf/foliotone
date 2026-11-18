@@ -155,6 +155,7 @@ class ReaderService : MediaBrowserService() {
                         "sleep timer", "stop in 30 minutes", "temporizador", "dormir" -> { setSleep(30); return }
                         "sleep at end of chapter", "stop at end of chapter", "al final del capítulo" -> { setSleep(-1); return }
                         "cancel sleep timer", "cancelar temporizador" -> { setSleep(0); return }
+                        "report sentence", "report that", "reportar frase", "reportar" -> { reportSentence(); return }
                     }
                     val found = store.books().firstOrNull { query.isNullOrBlank() || it.title.contains(query, true) }
                     if (found != null) open(found.id, null, false, true)
@@ -270,6 +271,7 @@ class ReaderService : MediaBrowserService() {
             "PLAY" -> play()
             "REPLAY" -> replay()
             "BACK15" -> rewind(15)
+            "REPORT" -> reportSentence()
             "READ_FROM" -> readFrom(intent.getIntExtra("section", -1), intent.getIntExtra("page", -1),
                 intent.getIntExtra("char", 0), intent.getBooleanExtra("play", true))
             "SLEEP" -> setSleep(intent.getIntExtra("minutes", 0))
@@ -460,6 +462,31 @@ class ReaderService : MediaBrowserService() {
         store.addBookmark(b.id, BookStore.Bookmark(b.section, b.page, start, snippet, System.currentTimeMillis()))
         Toast.makeText(this, tr("Bookmark added"), Toast.LENGTH_SHORT).show()
         notifyChildrenChanged("bookmarks")
+    }
+
+    /**
+     * Saves the sentence just read (as on the page and as given to the voice) for review in Listening
+     * settings → Reported sentences, where a pronunciation fix can be added or the list shared.
+     */
+    private fun reportSentence() {
+        val b = book ?: return
+        val language = NarrationVoices.locale(b.language).language
+        val piece = playedChunks.lastOrNull { it.text.isNotBlank() }
+        val (original, spokenText) = if (piece != null) {
+            val page = sections.getOrNull(piece.section)?.pages?.getOrNull(piece.page).orEmpty()
+            val end = if (piece.end > piece.start) piece.end.coerceAtMost(page.length) else page.length
+            page.substring(piece.start.coerceIn(0, page.length), end.coerceAtLeast(piece.start.coerceIn(0, page.length))).trim() to piece.text
+        } else {
+            val page = sections.getOrNull(b.section)?.pages?.getOrNull(b.page).orEmpty()
+            val start = sentenceStart(page, (deviceChar ?: 0).coerceIn(0, page.length))
+            val end = SENTENCE_END.find(page, start)?.range?.last?.plus(1) ?: page.length
+            val text = page.substring(start, end).trim()
+            text to SpeechText.normalize(text, language)
+        }
+        if (original.isBlank()) return
+        val engine = store.speechEngine ?: android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.TTS_DEFAULT_SYNTH) ?: "default"
+        store.saveReports(store.reports() + BookStore.Report(original, spokenText, b.title, engine, System.currentTimeMillis()))
+        Toast.makeText(this, tr("Sentence saved for review"), Toast.LENGTH_SHORT).show()
     }
 
     /** Tells the reader screen which part of the page is being read, so it can highlight it. */
