@@ -63,6 +63,20 @@ class MainActivity : Activity() {
     private var previewEpoch = 0
     private var pendingVoiceRefresh = false
     private var inSettings = false
+    /** Full-screen reading: only the page and a slim control row. */
+    private var focusMode = false
+    /** The reading page on screen and the part of it being narrated (highlighted). */
+    private var pageView: TextView? = null
+    private var pageKey: Triple<String, Int, Int>? = null
+    private var spokenRange: Pair<Triple<String, Int, Int>, IntRange>? = null
+    private val spokenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val id = intent?.getStringExtra("id") ?: return
+            val key = Triple(id, intent.getIntExtra("section", -1), intent.getIntExtra("page", -1))
+            spokenRange = key to (intent.getIntExtra("start", 0) until intent.getIntExtra("end", 0))
+            highlightSpoken(scrollTo = true)
+        }
+    }
     private var settingsLanguage = "en"
     private val coverCache = LruCache<String, Bitmap>(12)
     private var selectedId: String? = null
@@ -272,6 +286,9 @@ class MainActivity : Activity() {
         val gutenbergFilter = IntentFilter(GutenbergDownloadService.UPDATE)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(gutenbergReceiver, gutenbergFilter, RECEIVER_NOT_EXPORTED)
         else registerReceiver(gutenbergReceiver, gutenbergFilter)
+        val spokenFilter = IntentFilter("com.linguareader.SPOKEN")
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(spokenReceiver, spokenFilter, RECEIVER_NOT_EXPORTED)
+        else registerReceiver(spokenReceiver, spokenFilter)
         // Focus loss and remote controls can change playback while this screen is stopped.
         // Subscribe first, then ask for a snapshot so no background change is missed.
         command("GET_STATE")
@@ -288,6 +305,7 @@ class MainActivity : Activity() {
         unregisterReceiver(stateReceiver)
         unregisterReceiver(offlineReceiver)
         unregisterReceiver(gutenbergReceiver)
+        unregisterReceiver(spokenReceiver)
         super.onStop()
     }
     override fun onDestroy() {
@@ -519,6 +537,7 @@ class MainActivity : Activity() {
         extras.forEach { (key, value) -> when (value) {
             is String -> intent.putExtra(key, value)
             is Int -> intent.putExtra(key, value)
+            is Boolean -> intent.putExtra(key, value)
         } }
         startService(intent)
     }
@@ -1317,6 +1336,20 @@ class MainActivity : Activity() {
         }
 
         val reading = settingsGroup(tr("Reading"))
+        val sizes = listOf(16f to tr("Small"), 19f to tr("Medium"), 22f to tr("Large"), 26f to tr("Extra large"))
+        val size = sizes.minByOrNull { kotlin.math.abs(it.first - store.readerTextSize) } ?: sizes[1]
+        settingRow(reading, tr("Text size"), size.second) {
+            choiceSheet(tr("Text size"), sizes.map { MenuChoice(it.second) }, sizes.indexOf(size)) {
+                store.readerTextSize = sizes[it].first; showSettings()
+            }
+        }
+        val spacings = listOf(3f to tr("Tight"), 7f to tr("Normal"), 12f to tr("Relaxed"))
+        val spacing = spacings.minByOrNull { kotlin.math.abs(it.first - store.readerLineSpacing) } ?: spacings[1]
+        settingRow(reading, tr("Line spacing"), spacing.second) {
+            choiceSheet(tr("Line spacing"), spacings.map { MenuChoice(it.second) }, spacings.indexOf(spacing)) {
+                store.readerLineSpacing = spacings[it].first; showSettings()
+            }
+        }
         switchRow(reading, tr("Resume one page earlier"), tr("Keeps a little context when reopening a book."),
             store.contextResume) { store.contextResume = it }
         switchRow(reading, tr("Automatically mark finished books as read"),
@@ -2065,6 +2098,7 @@ class MainActivity : Activity() {
         val sectionIndex = (sessionSection ?: book.section).coerceIn(parsed.sections.indices)
         val section = parsed.sections[sectionIndex]
         val pageIndex = (sessionPage ?: book.page).coerceIn(section.pages.indices)
+        if (focusMode) { showFocusReader(book, sectionIndex, pageIndex, section.pages[pageIndex]); return }
         val bookProgress = progress(book.copy(
             section = sectionIndex,
             page = pageIndex,
@@ -2152,12 +2186,142 @@ class MainActivity : Activity() {
         gap(16)
         addText(tr("READING PAGE"), 11f, accent).typeface = Typeface.DEFAULT_BOLD
         gap(8)
-        content.addView(text(section.pages[pageIndex], 19f, palette.paperInk).apply {
+        content.addView(readingPage(book, sectionIndex, pageIndex, section.pages[pageIndex]))
+    }
+
+    /**
+     * The page text: sized from the reading settings, the sentence being narrated highlighted, and a tap
+     * on a sentence reads from there.
+     */
+    private fun readingPage(book: Book, sectionIndex: Int, pageIndex: Int, page: String): TextView {
+        val view = text(page, store.readerTextSize, palette.paperInk).apply {
             typeface = Typeface.SERIF
-            setLineSpacing(dp(7).toFloat(), 1.06f)
+            setLineSpacing(dp(store.readerLineSpacing.toInt()).toFloat(), 1.06f)
             setPadding(dp(16), dp(18), dp(16), dp(20))
             background = rounded(palette.paper, 16)
+            isClickable = true
+            contentDescription = tr("Reading page. Tap a sentence to read from there.")
+        }
+        val tap = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: android.view.MotionEvent) = true
+            override fun onSingleTapUp(e: android.view.MotionEvent): Boolean {
+                val offset = view.getOffsetForPosition(e.x, e.y)
+                if (offset < 0) return false
+                command("READ_FROM", "section" to sectionIndex, "page" to pageIndex, "char" to offset)
+                return true
+            }
         })
+        view.setOnTouchListener { _, event -> tap.onTouchEvent(event); false }
+        pageView = view
+        pageKey = Triple(book.id, sectionIndex, pageIndex)
+        view.post { highlightSpoken(scrollTo = playing) }
+        return view
+    }
+
+    /** Applies the narrated range to the page on screen, scrolling it into view if it is off screen. */
+    private fun highlightSpoken(scrollTo: Boolean) {
+        val view = pageView ?: return
+        val (key, range) = spokenRange ?: return
+        if (key != pageKey) return
+        val text = view.text.toString()
+        val start = range.first.coerceIn(0, text.length)
+        val end = (range.last + 1).coerceIn(start, text.length)
+        val styled = android.text.SpannableString(text)
+        if (end > start) styled.setSpan(android.text.style.BackgroundColorSpan((accent and 0x00FFFFFF) or 0x40000000),
+            start, end, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        view.text = styled
+        if (!scrollTo || end <= start) return
+        val layout = view.layout ?: return
+        val lineTop = view.top + view.paddingTop + layout.getLineTop(layout.getLineForOffset(start))
+        val visibleTop = scroll.scrollY
+        val visibleBottom = visibleTop + scroll.height
+        if (lineTop < visibleTop + dp(40) || lineTop > visibleBottom - dp(120)) {
+            scroll.smoothScrollTo(0, (lineTop - scroll.height / 3).coerceAtLeast(0))
+        }
+    }
+
+    /** Full-screen reading: page text with a slim control row. */
+    private fun showFocusReader(book: Book, sectionIndex: Int, pageIndex: Int, page: String) {
+        content.removeAllViews()
+        val listen = compact(button(playbackLabel()) { command(if (playing) "PAUSE" else "PLAY") }, 40)
+        playbackButton = listen
+        content.addView(rowOf(compact(secondary(tr("✕")) { focusMode = false; showReader() }, 40).apply {
+                contentDescription = tr("Leave full screen")
+            },
+            compact(secondary(tr("◀")) { command("PREVIOUS") }, 40).apply { contentDescription = tr("Back") },
+            compact(secondary(tr("⟲ 15 s")) { command("BACK15") }, 40),
+            listen,
+            compact(secondary(tr("▶")) { command("NEXT") }, 40).apply { contentDescription = tr("Next") }))
+        gap(10)
+        content.addView(readingPage(book, sectionIndex, pageIndex, page))
+    }
+
+    /** Finds [query] in the book (ignoring case and accents) and lists where it appears. */
+    private fun searchBook(book: Book) {
+        val parsed = cachedBook?.takeIf { cachedBookId == book.id } ?: return
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(24), dp(22), dp(24))
+            background = rounded(surface, 22)
+        }
+        panel.addView(text(tr("Search in this book"), 22f).apply { typeface = Typeface.SERIF })
+        val input = EditText(this).apply {
+            hint = tr("Words to find")
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            setTextColor(ink); setHintTextColor(muted)
+            textSize = 15f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(surfaceRaised, 12)
+        }
+        panel.addView(input, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        fun fold(value: String) = java.text.Normalizer.normalize(value.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}"), "")
+        fun run() {
+            val query = fold(input.text.toString().trim())
+            if (query.length < 2) return
+            dialog.dismiss()
+            data class Hit(val section: Int, val page: Int, val char: Int, val snippet: String)
+            val hits = mutableListOf<Hit>()
+            outer@ for ((s, section) in parsed.sections.withIndex()) for ((p, text) in section.pages.withIndex()) {
+                // Folding keeps every character's position (accents become combining marks that are removed),
+                // so search a folded copy built per character.
+                val folded = text.map { fold(it.toString()).firstOrNull() ?: it }.joinToString("")
+                var from = 0
+                while (true) {
+                    val at = folded.indexOf(query, from)
+                    if (at < 0) break
+                    val begin = (at - 40).coerceAtLeast(0)
+                    val snippet = (if (begin > 0) "…" else "") + text.substring(begin, (at + query.length + 50).coerceAtMost(text.length))
+                        .replace(Regex("\\s+"), " ") + "…"
+                    hits += Hit(s, p, at, snippet)
+                    if (hits.size >= 60) break@outer
+                    from = at + query.length
+                }
+            }
+            if (hits.isEmpty()) { toast(tr("No matches for “{0}”", input.text.toString().trim())); return }
+            choiceSheet(tr("{0} matches", if (hits.size >= 60) "60+" else hits.size.toString()), hits.map {
+                MenuChoice(it.snippet, tr("{0} · page {1}", parsed.sections[it.section].title, it.page + 1))
+            }) { index ->
+                val hit = hits[index]
+                sessionSection = hit.section
+                sessionPage = hit.page
+                spokenRange = Triple(book.id, hit.section, hit.page) to (hit.char until hit.char + query.length)
+                command("READ_FROM", "section" to hit.section, "page" to hit.page, "char" to hit.char, "play" to false)
+                showReader()
+                pageView?.post { highlightSpoken(scrollTo = true) }
+            }
+        }
+        input.setOnEditorActionListener { _, _, _ -> run(); true }
+        panel.addView(button(tr("Search")) { run() }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+        dialog.setContentView(panel)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.9).toInt(), -2)
+        dialog.show()
+        input.requestFocus()
     }
 
     private fun playbackLabel() = if (playing) tr("Ⅱ  Pause") else tr("▶  Listen")
@@ -2421,6 +2585,10 @@ class MainActivity : Activity() {
                 }
             }
         )
+        actions += MenuChoice(tr("Full-screen reading"), tr("Only the page and the playback buttons")) to {
+            focusMode = true; showReader()
+        }
+        actions += MenuChoice(tr("Search in this book")) to { searchBook(book) }
         actions += MenuChoice(tr("Sleep timer"), when {
             sleepAtSectionEnd -> tr("Stops at the end of this chapter")
             sleepAt > 0 -> tr("Stops at {0}", java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(sleepAt)))

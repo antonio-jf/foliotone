@@ -146,6 +146,14 @@ class BookStore private constructor(private val context: Context) {
         return prefs.getFloat(own ?: "speech_rate", 0.94f).coerceIn(0.75f, 1.2f)
     }
 
+    /** Reading page text size (sp) and extra line spacing (dp). */
+    var readerTextSize: Float
+        get() = prefs.getFloat("reader_text_size", 19f).coerceIn(14f, 30f)
+        set(value) { prefs.edit().putFloat("reader_text_size", value).apply() }
+    var readerLineSpacing: Float
+        get() = prefs.getFloat("reader_line_spacing", 7f).coerceIn(0f, 20f)
+        set(value) { prefs.edit().putFloat("reader_line_spacing", value).apply() }
+
     /** Gapless playback: multiplier for the pauses after sentences and paragraphs (0 = none). */
     var pauseScale: Float
         get() = prefs.getFloat("pause_scale", 1f).coerceIn(0f, 2f)
@@ -536,6 +544,7 @@ object Epub {
             manifest[item.getAttribute("id")] = item.getAttribute("href")
         }
         val base = opfPath.substringBeforeLast('/', "")
+        val toc = runCatching { tableOfContents(opf, base, ::read) }.getOrDefault(emptyMap())
         val sections = mutableListOf<Section>()
         val spine = opf.getElementsByTagNameNS("*", "itemref")
         require(spine.length <= 2_000) { tr("EPUB has too many sections") }
@@ -561,13 +570,56 @@ object Epub {
             val pages = paginate(text)
             totalPages += pages.size
             require(totalPages <= 12_000) { tr("EPUB has too many pages") }
-            if (pages.isNotEmpty()) sections += Section(heading.ifBlank { "Section ${sections.size + 1}" }, pages)
+            // Title: the book's table of contents, else the first heading, else a short first line.
+            val firstLine = paragraphs.firstOrNull()?.takeIf { it.length in 2..60 && it.last() !in ".,;:!?" }
+            val title = toc[path]?.takeIf { it.isNotBlank() } ?: heading.ifBlank { firstLine ?: "" }
+            if (pages.isNotEmpty()) sections += Section(title.ifBlank { "Section ${sections.size + 1}" }, pages)
         }
         require(sections.isNotEmpty()) { tr("This EPUB has no readable text") }
         val declared = meta("language").substringBefore('-').lowercase()
         ParsedBook(meta("title").ifBlank { file.nameWithoutExtension }, meta("creator"),
             if (declared in languages) declared else inferLanguage(sections.take(3).flatMap { it.pages.take(2) }.joinToString(" ")),
             sections)
+    }
+
+    /**
+     * Chapter titles from the EPUB's own table of contents, by content file: the EPUB 3 navigation
+     * document (manifest item with properties="nav") or the EPUB 2 NCX (spine toc="…"). The first entry
+     * pointing into a file names it.
+     */
+    private fun tableOfContents(opf: org.w3c.dom.Document, base: String, read: (String, Int) -> ByteArray): Map<String, String> {
+        val titles = linkedMapOf<String, String>()
+        val items = opf.getElementsByTagNameNS("*", "item")
+        val manifest = (0 until items.length).map { items.item(it) as Element }
+        fun add(file: String, href: String, title: String) {
+            val clean = title.replace(Regex("\\s+"), " ").trim()
+            if (clean.isEmpty() || href.isBlank()) return
+            val target = resolve(file.substringBeforeLast('/', ""), href.substringBefore('#'))
+            titles.putIfAbsent(target, clean)
+        }
+        manifest.firstOrNull { "nav" in it.getAttribute("properties").split(' ') }?.let { nav ->
+            val path = resolve(base, nav.getAttribute("href"))
+            val doc = Jsoup.parse(read(path, 2 * 1024 * 1024).toString(Charsets.UTF_8))
+            val list = doc.getElementsByTag("nav").firstOrNull { "toc" in it.attr("epub:type").split(' ') }
+                ?: doc.getElementsByTag("nav").firstOrNull()
+            list?.getElementsByTag("a")?.forEach { link -> add(path, link.attr("href"), link.text()) }
+        }
+        if (titles.isEmpty()) {
+            val spine = opf.getElementsByTagNameNS("*", "spine").item(0) as? Element
+            val ncxId = spine?.getAttribute("toc").orEmpty()
+            val ncx = manifest.firstOrNull { it.getAttribute("id") == ncxId && ncxId.isNotEmpty() }
+                ?: manifest.firstOrNull { it.getAttribute("media-type") == "application/x-dtbncx+xml" }
+            ncx?.let { item ->
+                val path = resolve(base, item.getAttribute("href"))
+                val doc = Jsoup.parse(read(path, 2 * 1024 * 1024).toString(Charsets.UTF_8), "", org.jsoup.parser.Parser.xmlParser())
+                doc.getElementsByTag("navPoint").forEach { point ->
+                    val label = point.getElementsByTag("navLabel").firstOrNull()?.getElementsByTag("text")?.firstOrNull()?.text().orEmpty()
+                    val src = point.getElementsByTag("content").firstOrNull()?.attr("src").orEmpty()
+                    add(path, src, label)
+                }
+            }
+        }
+        return titles
     }
 
     private fun resolve(base: String, href: String): String {
