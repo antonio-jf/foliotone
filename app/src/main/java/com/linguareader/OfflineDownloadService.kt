@@ -91,7 +91,7 @@ class OfflineDownloadService : Service() {
             val key = ElevenLabsKey(this).read() ?: error(tr("Connect ElevenLabs in Listening settings"))
             val voice = store.elevenVoiceId(NarrationVoices.locale(book.language).language)
                 ?: error(tr("Choose an ElevenLabs voice for this book"))
-            val rate = store.speechRate
+            val rate = store.speechRateFor(book.id)
             val sections = Epub.parse(store.file(book)).sections
             val pages = sections.flatMap { it.pages }
             val eleven = ElevenLabs(this)

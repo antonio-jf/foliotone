@@ -32,6 +32,12 @@ Switching an installed app to a new key takes one reinstall. Back up its data fi
 
 FolioTone checks GitHub's latest release when it opens (at most every 6 hours) and twice a day in the background. When a newer release exists, it downloads the APK, checks it against the release's `SHA256SUMS.txt` and against the installed app's signing key, and offers **Install now / Later**. The background check shows a notification instead. **Listening settings → App updates** shows the installed version, checks on demand, installs a downloaded update and turns automatic downloads off. Installing always starts with your tap. The first time, Android asks you to allow FolioTone to install apps and to confirm the install. On Android 12 and later, once FolioTone has installed itself, later updates install without the system confirmation. Builds from Android Studio (debuggable) never check automatically, so a development build is not replaced by a release, but you can still check by hand. The update can only install when the release and the installed app are signed with the same key.
 
+### In the car (Android Auto)
+
+FolioTone shows three tabs in Android Auto. **Continue** lists recently read books with their cover, place and progress, and tapping one resumes it. **Library** is a cover grid, and each book opens its chapters with the current one marked. **Chapters** lists the chapters of the current book. Saying "play <title> on FolioTone" finds a book by voice. The playback screen has Section start, plus Replay for non-Google device voices.
+
+Android Auto only shows apps installed from the Play Store unless you allow others. On the phone, open **Android Auto settings**, tap **Version** about 10 times to unlock developer settings, then use the ⋮ menu → **Developer settings** → **Unknown sources**. Without this, tapping FolioTone in the car asks you to use the phone.
+
 ## Use
 
 - **Import EPUB** copies a selected book into private app storage and extracts its cover. **Choose folder** grants access to a user-selected folder, scans its EPUB files, and copies them into the same library. Use **Scan folder again** after adding files. Books without an embedded cover receive a styled placeholder.

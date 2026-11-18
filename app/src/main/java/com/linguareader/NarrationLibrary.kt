@@ -6,11 +6,11 @@ import java.io.File
 /** Book-level view of saved narration for both cloud sources: library badges and storage clean-up. */
 object NarrationLibrary {
     /** Identity of the current voice for [source]; audio saved for another voice does not count. */
-    fun voiceFor(context: Context, source: String, language: String): String? {
+    fun voiceFor(context: Context, source: String, language: String, bookId: String? = null): String? {
         val store = BookStore.get(context)
         return when (source) {
             "server" -> store.serverVoice(language)
-            "elevenlabs" -> store.elevenVoiceId(language)?.let { "$it@${store.speechRate}" }
+            "elevenlabs" -> store.elevenVoiceId(language)?.let { "$it@${bookId?.let(store::speechRateFor) ?: store.speechRate}" }
             else -> null
         }
     }
@@ -26,9 +26,9 @@ object NarrationLibrary {
         val key = ElevenLabsKey(context).read()
         val elevenVoice = store.elevenVoiceId(language)
         if (key != null && elevenVoice != null) {
-            val (saved, total) = ElevenLabs(context).savedPages(book.id, sections, key, elevenVoice, store.speechRate)
-            store.setNarrationStatus("elevenlabs", book.id,
-                NarrationStatus("$elevenVoice@${store.speechRate}", saved, total))
+            val rate = store.speechRateFor(book.id)
+            val (saved, total) = ElevenLabs(context).savedPages(book.id, sections, key, elevenVoice, rate)
+            store.setNarrationStatus("elevenlabs", book.id, NarrationStatus("$elevenVoice@$rate", saved, total))
         }
     }
 
@@ -45,7 +45,7 @@ object NarrationLibrary {
             if (!present) { store.setNarrationStatus(source, book.id, null); continue }
             val name = if (source == "server") tr("Server narration") else tr("ElevenLabs narration")
             return when {
-                status.voice != voiceFor(context, source, language) -> tr("🎧 {0} saved for another voice", name) to false
+                status.voice != voiceFor(context, source, language, book.id) -> tr("🎧 {0} saved for another voice", name) to false
                 status.complete -> tr("🎧 {0} downloaded", name) to true
                 else -> tr("🎧 {0} · {1}% downloaded", name, (status.saved * 100 / status.total.coerceAtLeast(1)).coerceIn(1, 99)) to false
             }
