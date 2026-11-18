@@ -23,7 +23,9 @@ keys = {}
 for path in sorted((ROOT / "java").rglob("*.kt")):
     src = path.read_text(encoding="utf-8")
     for lit in scan(src):
-        if src[max(0, lit.start - 3):lit.start] != "tr(" or not lit.parts or lit.parts[0][0] == "raw":
+        before = src[max(0, lit.start - 4):lit.start]
+        if not before.endswith("tr(") or (len(before) == 4 and (before[0].isalnum() or before[0] == "_")) \
+                or not lit.parts or lit.parts[0][0] == "raw":
             continue
         if any(kind != "text" for kind, _ in lit.parts):
             print(f"{path.name}: tr() must get a plain text with {{0}} placeholders, not a template:",

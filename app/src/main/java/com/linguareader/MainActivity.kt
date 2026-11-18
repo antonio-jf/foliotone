@@ -471,18 +471,7 @@ class MainActivity : Activity() {
      * each section as an equal share is badly off. Books not opened since this was added only know the
      * current section's size and fall back to that estimate until they are opened once.
      */
-    private fun progress(book: Book): Int {
-        if (store.isRead(book.id)) return 100
-        if (book.sectionCount <= 0) return 0
-        val pages = book.sectionPages
-        val total = pages.sum()
-        if (pages.size == book.sectionCount && total > 0) {
-            val read = pages.take(book.section.coerceIn(0, pages.size)).sum() + book.page
-            return (read * 100L / total).toInt().coerceIn(0, 100)
-        }
-        return (((book.section + book.page.toFloat() / book.pagesInSection.coerceAtLeast(1)) / book.sectionCount) * 100)
-            .toInt().coerceIn(0, 100)
-    }
+    private fun progress(book: Book): Int = store.progressPercent(book)
     private fun progressBar(value: Int) = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
         max = 100; progress = value
         progressTintList = android.content.res.ColorStateList.valueOf(accent)

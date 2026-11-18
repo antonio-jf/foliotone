@@ -104,7 +104,33 @@ class BookStore private constructor(private val context: Context) {
 
     var lastOpenedId: String?
         get() = prefs.getString("last_opened_id", null)
-        set(value) { prefs.edit().putString("last_opened_id", value).apply() }
+        set(value) {
+            val recent = (listOfNotNull(value) + recentIds().filter { it != value }).take(12)
+            prefs.edit().putString("last_opened_id", value).putString("recent_ids", recent.joinToString(",")).apply()
+        }
+
+    private fun recentIds() = prefs.getString("recent_ids", null).orEmpty().split(',').filter { it.isNotBlank() }
+
+    /** Books opened most recently, newest first (books never opened are left out). */
+    fun recentBooks(limit: Int): List<Book> {
+        val byId = books().associateBy { it.id }
+        val ids = (listOfNotNull(lastOpenedId) + recentIds()).distinct()
+        return ids.mapNotNull { byId[it] }.take(limit)
+    }
+
+    /** Percent of [book] read, counted in pages across sections (100 when marked as read). */
+    fun progressPercent(book: Book): Int {
+        if (isRead(book.id)) return 100
+        if (book.sectionCount <= 0) return 0
+        val pages = book.sectionPages
+        val total = pages.sum()
+        if (pages.size == book.sectionCount && total > 0) {
+            val read = pages.take(book.section.coerceIn(0, pages.size)).sum() + book.page
+            return (read * 100L / total).toInt().coerceIn(0, 100)
+        }
+        return (((book.section + book.page.toFloat() / book.pagesInSection.coerceAtLeast(1)) / book.sectionCount) * 100)
+            .toInt().coerceIn(0, 100)
+    }
 
     var speechRate: Float
         get() = prefs.getFloat("speech_rate", 0.94f).coerceIn(0.75f, 1.2f)

@@ -11,6 +11,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaDescription
+import android.net.Uri
 import android.media.MediaMetadata
 import android.media.MediaPlayer
 import android.media.browse.MediaBrowser
@@ -114,6 +115,10 @@ class ReaderService : MediaBrowserService() {
                 override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
                     val tokens = mediaId?.split(':') ?: return
                     if (tokens.size >= 2 && tokens[0] == "book") open(tokens[1], tokens.getOrNull(2)?.toIntOrNull(), false, true)
+                    // Continue: where the book was left, one page earlier if that setting is on.
+                    if (tokens.size >= 2 && tokens[0] == "resume") {
+                        if (book?.id == tokens[1]) { if (!playing) play() } else open(tokens[1], null, true, true)
+                    }
                 }
                 override fun onPlayFromSearch(query: String?, extras: Bundle?) {
                     when (query?.trim()?.lowercase()) {
@@ -998,8 +1003,8 @@ class ReaderService : MediaBrowserService() {
                 PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH)
             .setState(if (cloudLoading) PlaybackState.STATE_BUFFERING else if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
                 mediaPosition(), if (playing && !cloudLoading) 1f else 0f, SystemClock.elapsedRealtime())
-            .addCustomAction("section_start", tr("Start section"), R.drawable.ic_foliotone_monochrome)
-        if (store.replayUseful(this)) builder.addCustomAction("replay", tr("Replay"), R.drawable.ic_foliotone_monochrome)
+        if (store.replayUseful(this)) builder.addCustomAction("replay", tr("Replay"), R.drawable.ic_car_replay)
+        builder.addCustomAction("section_start", tr("Start section"), R.drawable.ic_car_section_start)
         if (error != null) builder.setErrorMessage(error)
         session.setPlaybackState(builder.build())
     }
@@ -1054,30 +1059,126 @@ class ReaderService : MediaBrowserService() {
         return builder.build()
     }
 
-    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot = BrowserRoot("root", null)
+    // ---- Android Auto (and other media browsers): the car UI ----
+    //
+    // Media apps can't draw their own car screens; Android Auto builds them from this browse tree. Root
+    // children become tabs: Continue (recent books, resume where you left off), Library (cover grid,
+    // each book opens its chapters) and Chapters (the current book). Search finds books by title or
+    // author. Covers come from CoverProvider; progress shows as a bar via the completion extras.
+
+    private companion object Car {
+        const val CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
+        const val STYLE_BROWSABLE = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT"
+        const val STYLE_PLAYABLE = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
+        const val STYLE_SINGLE_ITEM = "android.media.browse.CONTENT_STYLE_SINGLE_ITEM_HINT"
+        const val STYLE_LIST = 1
+        const val STYLE_GRID = 2
+        const val SEARCH_SUPPORTED = "android.media.browse.SEARCH_SUPPORTED"
+        const val PLAYBACK_STATUS = "android.media.extra.PLAYBACK_STATUS"
+        const val STATUS_NOT_PLAYED = 0
+        const val STATUS_PARTIAL = 1
+        const val STATUS_DONE = 2
+        const val COMPLETION = "androidx.media.MediaItem.Extras.COMPLETION_PERCENTAGE"
+    }
+
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+        // Android's media resumption asks for just the most recent item.
+        if (rootHints?.getBoolean(BrowserRoot.EXTRA_RECENT) == true) {
+            return BrowserRoot("recent", Bundle().apply { putBoolean(BrowserRoot.EXTRA_RECENT, true) })
+        }
+        return BrowserRoot("root", Bundle().apply {
+            putBoolean(CONTENT_STYLE_SUPPORTED, true)
+            putInt(STYLE_BROWSABLE, STYLE_GRID)
+            putInt(STYLE_PLAYABLE, STYLE_LIST)
+            putBoolean(SEARCH_SUPPORTED, true)
+        })
+    }
+
+    private fun resourceUri(name: String) = Uri.parse("android.resource://$packageName/drawable/$name")
+
+    private fun tab(id: String, title: String, icon: String, childStyle: Int) = MediaBrowser.MediaItem(
+        MediaDescription.Builder().setMediaId(id).setTitle(title).setIconUri(resourceUri(icon))
+            .setExtras(Bundle().apply { putInt(STYLE_BROWSABLE, childStyle); putInt(STYLE_PLAYABLE, childStyle) })
+            .build(), MediaBrowser.MediaItem.FLAG_BROWSABLE)
+
+    /** Progress extras: a bar in the car plus "not started / in progress / finished". */
+    private fun progressExtras(b: Book) = Bundle().apply {
+        val percent = store.progressPercent(b)
+        putInt(PLAYBACK_STATUS, when { percent >= 100 -> STATUS_DONE; percent > 0 || b.section > 0 || b.page > 0 -> STATUS_PARTIAL; else -> STATUS_NOT_PLAYED })
+        putDouble(COMPLETION, percent / 100.0)
+    }
+
+    private fun whereIn(b: Book): String {
+        val percent = store.progressPercent(b)
+        return if (b.sectionCount > 0) tr("Section {0} of {1} · {2}%", b.section + 1, b.sectionCount, percent)
+            else b.author.ifBlank { tr("Book") }
+    }
+
+    /** Plays [b] from where it was left. */
+    private fun resumeItem(b: Book) = MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("resume:${b.id}")
+        .setTitle(b.title).setSubtitle(whereIn(b)).setDescription(b.author)
+        .setIconUri(CoverProvider.uri(this, store, b)).setExtras(progressExtras(b)).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE)
+
+    /** Opens [b]'s chapter list. */
+    private fun bookItem(b: Book) = MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("book:${b.id}")
+        .setTitle(b.title).setSubtitle(b.author.ifBlank { whereIn(b) })
+        .setIconUri(CoverProvider.uri(this, store, b))
+        .setExtras(progressExtras(b).apply { putInt(STYLE_PLAYABLE, STYLE_LIST) }).build(), MediaBrowser.MediaItem.FLAG_BROWSABLE)
+
+    /** "Continue from …" first, then every chapter; the current one is marked. */
+    private fun chapterItems(b: Book): MutableList<MediaBrowser.MediaItem> {
+        val items = mutableListOf(MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("resume:${b.id}")
+            .setTitle(tr("Continue listening")).setSubtitle(whereIn(b))
+            .setIconUri(resourceUri("ic_car_continue")).setExtras(progressExtras(b)).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE))
+        val chapters = if (book?.id == b.id && sections.isNotEmpty()) sections
+            else runCatching { Epub.parse(store.file(b)).sections }.getOrDefault(emptyList())
+        chapters.forEachIndexed { index, section ->
+            val current = index == b.section
+            items += MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("book:${b.id}:$index")
+                .setTitle(section.title)
+                .setSubtitle(if (current) tr("Reading now · page {0} of {1}", b.page + 1, section.pages.size)
+                    else tr("{0} pages", section.pages.size))
+                .setExtras(Bundle().apply {
+                    putInt(PLAYBACK_STATUS, when { index < b.section -> STATUS_DONE; current -> STATUS_PARTIAL; else -> STATUS_NOT_PLAYED })
+                    if (current) putDouble(COMPLETION, b.page.toDouble() / section.pages.size.coerceAtLeast(1))
+                }).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE)
+        }
+        return items
+    }
 
     override fun onLoadChildren(parentId: String, result: Result<MutableList<MediaBrowser.MediaItem>>) {
-        if (parentId == "root") {
-            val items = mutableListOf<MediaBrowser.MediaItem>()
-            store.books().forEach { b ->
-                items += MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("book:${b.id}")
-                    .setTitle(b.title).setSubtitle(b.author.ifBlank { tr("Book") }).build(), MediaBrowser.MediaItem.FLAG_BROWSABLE)
-            }
-            result.sendResult(items)
-        } else if (parentId.startsWith("book:")) {
-            result.detach()
-            val id = parentId.removePrefix("book:")
-            browseWorker.execute {
-                val items = mutableListOf<MediaBrowser.MediaItem>()
-                store.books().firstOrNull { it.id == id }?.let { b ->
-                    runCatching { Epub.parse(store.file(b)).sections }.getOrDefault(emptyList()).forEachIndexed { index, section ->
-                        items += MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("book:$id:$index")
-                            .setTitle(section.title).setSubtitle(tr("{0} pages", section.pages.size)).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE)
-                    }
+        result.detach()
+        browseWorker.execute {
+            val items: MutableList<MediaBrowser.MediaItem> = runCatching {
+                when {
+                    parentId == "root" -> mutableListOf(
+                        tab("continue", tr("Continue"), "ic_car_continue", STYLE_LIST),
+                        tab("library", tr("Library"), "ic_car_library", STYLE_GRID),
+                        tab("chapters", tr("Chapters"), "ic_car_chapters", STYLE_LIST))
+                    parentId == "recent" -> store.recentBooks(1).map { resumeItem(it) }.toMutableList()
+                    parentId == "continue" -> store.recentBooks(8).map { resumeItem(it) }.toMutableList()
+                        .ifEmpty { store.books().take(8).map { resumeItem(it) }.toMutableList() }
+                    parentId == "library" -> store.books().sortedBy { it.title.lowercase() }.map { bookItem(it) }.toMutableList()
+                    parentId == "chapters" -> (book ?: store.recentBooks(1).firstOrNull())?.let { chapterItems(it) } ?: mutableListOf()
+                    parentId.startsWith("book:") -> store.books().firstOrNull { it.id == parentId.removePrefix("book:") }
+                        ?.let { chapterItems(it) } ?: mutableListOf()
+                    else -> mutableListOf()
                 }
-                result.sendResult(items)
-            }
-        } else result.sendResult(mutableListOf())
+            }.getOrDefault(mutableListOf())
+            result.sendResult(items)
+        }
+    }
+
+    override fun onSearch(query: String, extras: Bundle?, result: Result<MutableList<MediaBrowser.MediaItem>>) {
+        result.detach()
+        browseWorker.execute {
+            val words = query.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
+            val found = store.books().filter { b ->
+                val haystack = "${b.title} ${b.author}".lowercase()
+                words.all { it in haystack }
+            }.map { resumeItem(it) }.toMutableList()
+            result.sendResult(found)
+        }
     }
 
     override fun onDestroy() {

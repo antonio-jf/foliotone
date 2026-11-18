@@ -30,6 +30,8 @@
         <service android:name=".GutenbergDownloadService" android:exported="false" android:foregroundServiceType="dataSync" />
         <service android:name=".UpdateCheckJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
         <receiver android:name=".UpdateInstallReceiver" android:exported="false" />
+        <provider android:name=".CoverProvider" android:authorities="com.linguareader.covers"
+            android:exported="false" android:grantUriPermissions="true" />
         <meta-data android:name="com.google.android.gms.car.application" android:resource="@xml/automotive_app_desc" />
     </application>
 </manifest>

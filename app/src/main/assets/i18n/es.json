@@ -478,5 +478,9 @@
  "Gapless playback": "Reproducción sin pausas",
  "Prepares the next sentences and page in advance, so voices like SherpaTTS read without pauses.": "Prepara por adelantado las siguientes frases y la siguiente página, para que voces como SherpaTTS lean sin pausas.",
  "Replay": "Repetir",
- "↺ Replay": "↺ Repetir"
+ "↺ Replay": "↺ Repetir",
+ "Section {0} of {1} · {2}%": "Sección {0} de {1} · {2}%",
+ "Continue listening": "Seguir escuchando",
+ "Reading now · page {0} of {1}": "Leyendo ahora · página {0} de {1}",
+ "Chapters": "Capítulos"
 }
