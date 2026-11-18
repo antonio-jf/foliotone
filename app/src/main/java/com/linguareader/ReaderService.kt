@@ -536,42 +536,90 @@ class ReaderService : MediaBrowserService() {
         }).start()
     }
 
-    /** Text from [start]/[offset] to the end of the book, in pieces of a few sentences. */
-    private fun renderChunks(start: PagePosition, offset: Int): Iterator<RenderAhead.Chunk> = iterator {
-        var position: PagePosition? = start
-        var from = offset
-        var first = true
-        while (position != null) {
-            val page = sections[position.section].pages[position.page]
-            // The first piece of a session stays short, so playback starts quickly.
-            for ((pieceStart, text) in renderPieces(page, from.coerceIn(0, page.length), if (first) 160 else 350)) {
-                if (text.isBlank()) continue
-                yield(RenderAhead.Chunk(position.section, position.page, pieceStart, text))
+    /** One sentence of a page: where it starts, its text, the pause after it, and whether it ends on this page. */
+    private class Sentence(val start: Int, val text: String, val pauseMs: Int, val complete: Boolean)
+
+    /**
+     * Text from [start]/[offset] to the end of the book, one sentence per piece. Sentence-sized pieces
+     * let FolioTone add the pauses after full stops and paragraphs that engines like SherpaTTS skip, and
+     * a sentence cut by a page break is joined into one piece so it is read in one breath.
+     */
+    private fun renderChunks(start: PagePosition, offset: Int): Iterator<RenderAhead.Chunk> {
+        val language = NarrationVoices.locale(book?.language.orEmpty()).language
+        val pages = sections
+        fun spoken(text: String) = SpeechText.normalize(text.trim(), language)
+        return iterator {
+            var position: PagePosition? = start
+            var from = offset
+            var carry: Pair<PagePosition, Sentence>? = null
+            while (true) {
+                val here = position ?: break
+                val page = pages[here.section].pages[here.page]
+                val sentences = renderSentences(page, from.coerceIn(0, page.length))
+                var index = 0
+                carry?.let { (carryPosition, unfinished) ->
+                    val head = spoken(unfinished.text)
+                    val rest = sentences.firstOrNull()
+                    if (rest != null) {
+                        val tail = spoken(rest.text)
+                        yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start,
+                            "$head $tail", rest.pauseMs, here.section, here.page, head.length + 1))
+                        index = 1
+                    } else {
+                        yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start, head, unfinished.pauseMs))
+                    }
+                }
+                carry = null
+                val following = nextPosition(here)
+                for (i in index until sentences.size) {
+                    val sentence = sentences[i]
+                    if (i == sentences.lastIndex && !sentence.complete && following != null) {
+                        carry = here to sentence
+                        break
+                    }
+                    val text = spoken(sentence.text)
+                    if (text.isNotBlank()) {
+                        yield(RenderAhead.Chunk(here.section, here.page, sentence.start, text, sentence.pauseMs))
+                    }
+                }
+                from = 0
+                position = following
             }
-            first = false
-            from = 0
-            position = nextPosition(position)
+            carry?.let { (carryPosition, unfinished) ->
+                yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start,
+                    spoken(unfinished.text), unfinished.pauseMs))
+            }
         }
     }
 
-    /** Splits a page from [from] into pieces of whole sentences, about 350 characters ([firstLimit] for the first). */
-    private fun renderPieces(page: String, from: Int, firstLimit: Int): List<Pair<Int, String>> {
-        val pieces = mutableListOf<Pair<Int, String>>()
-        val ends = Regex("[.!?…;:»”\"]+\\s+|\\n+").findAll(page, from).map { it.range.last + 1 }.toList() + page.length
-        var pieceStart = from
+    /**
+     * Splits a page from [from] into sentences. The pause after each follows its ending: a full stop,
+     * question or exclamation mark, a longer one for an ellipsis, and longer still for a paragraph break.
+     * Abbreviations (Mr., Dr., Sra., initials) do not end a sentence.
+     */
+    private fun renderSentences(page: String, from: Int): List<Sentence> {
+        val sentences = mutableListOf<Sentence>()
         var cursor = from
-        var limit = firstLimit
-        for (end in ends) {
-            if (end <= cursor) continue
-            if (end - pieceStart > limit && cursor > pieceStart) {
-                pieces += pieceStart to page.substring(pieceStart, cursor)
-                pieceStart = cursor
-                limit = 350
+        for (end in SENTENCE_END.findAll(page, from)) {
+            val stop = end.range.last + 1
+            if (end.value.startsWith(".") && !end.value.contains('\n')) {
+                val word = Regex("(\\p{L}+)$").find(page.substring(cursor, end.range.first))?.value.orEmpty()
+                if (word.lowercase() in ABBREVIATIONS || (word.length == 1 && word[0].isUpperCase())) continue
             }
-            cursor = end
+            val pause = when {
+                end.value.count { it == '\n' } >= 1 -> 650
+                end.value.contains('…') || end.value.contains("...") -> 450
+                else -> 320
+            }
+            if (page.substring(cursor, stop).isNotBlank()) sentences += Sentence(cursor, page.substring(cursor, stop), pause, true)
+            cursor = stop
         }
-        if (cursor > pieceStart) pieces += pieceStart to page.substring(pieceStart, cursor)
-        return pieces
+        val rest = page.substring(cursor)
+        if (rest.isNotBlank()) {
+            val complete = rest.trimEnd().lastOrNull()?.let { it in ".!?…»”\"'’)" } ?: true
+            sentences += Sentence(cursor, rest, 320, complete)
+        }
+        return sentences
     }
 
     private fun beginPlayback(): Boolean {
@@ -591,7 +639,8 @@ class ReaderService : MediaBrowserService() {
         val id = "$token:${position.section}:${position.page}"
         val page = sections[position.section].pages[position.page]
         val start = if (offset in 1 until page.length) offset else 0
-        val result = tts.speak(page.substring(start), mode, null, id)
+        val language = NarrationVoices.locale(book?.language.orEmpty()).language
+        val result = tts.speak(SpeechText.normalize(page.substring(start), language), mode, null, id)
         if (result != TextToSpeech.SUCCESS) return false
         deviceQueue.addLast(DeviceUtterance(position, id, start))
         return true
@@ -960,3 +1009,14 @@ class ReaderService : MediaBrowserService() {
         session.release(); super.onDestroy()
     }
 }
+
+/** End of a sentence (terminal punctuation, closing quotes, then space) or a paragraph break. */
+private val SENTENCE_END = Regex("[.!?…]+[»”\"'’)\\]]*\\s+|\\n\\s*\\n")
+
+/** Words followed by a full stop that does not end the sentence. */
+private val ABBREVIATIONS = setOf(
+    "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs", "etc", "pp", "vol", "fig",
+    "sra", "srta", "sres", "dra", "ud", "uds", "av", "pág", "núm",
+    "mme", "mlle", "hr", "bzw", "sig", "dott"
+)
+

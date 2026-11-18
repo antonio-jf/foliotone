@@ -37,7 +37,13 @@ class RenderAhead(
     private val token: Int,
     private val events: Events
 ) {
-    data class Chunk(val section: Int, val page: Int, val start: Int, val text: String)
+    /**
+     * One piece of speech: usually one sentence, starting at character [start] of a page. [pauseMs] of
+     * silence follows it. A sentence that runs onto the next page carries that page in [nextSection]/
+     * [nextPage]; the page turn is reported [splitAt] characters into [text].
+     */
+    data class Chunk(val section: Int, val page: Int, val start: Int, val text: String,
+                     val pauseMs: Int = 140, val nextSection: Int = -1, val nextPage: Int = -1, val splitAt: Int = 0)
 
     interface Events {
         fun onChunkStarted(chunk: Chunk)
@@ -47,9 +53,8 @@ class RenderAhead(
 
     companion object {
         const val ID_PREFIX = "render:"
-        private const val MAX_AHEAD = 12
+        private const val MAX_AHEAD = 24
         private const val SYNTHESIS_TIMEOUT_S = 90L
-        private const val GAP_MS = 140
     }
 
     private class Rendered(val chunk: Chunk, val file: File)
@@ -179,9 +184,18 @@ class RenderAhead(
                             main.post { if (!cancelled) events.onFailed("could not open the audio output") }
                             return
                         }
-                        boundaries.add(framesWritten to item.chunk)
+                        val chunk = item.chunk
+                        val startFrame = framesWritten
+                        boundaries.add(startFrame to chunk)
+                        if (chunk.nextPage >= 0 && chunk.splitAt in 1 until chunk.text.length) {
+                            // Turn the page roughly where the sentence crosses it.
+                            val frames = wav.pcm.size.toLong() / (2 * wav.channels)
+                            boundaries.add(startFrame + frames * chunk.splitAt / chunk.text.length to
+                                Chunk(chunk.nextSection, chunk.nextPage, 0, ""))
+                        }
                         write(output, wav.pcm, wav.channels)
-                        write(output, ByteArray(wav.rate * wav.channels * 2 * GAP_MS / 1000), wav.channels)
+                        val pause = chunk.pauseMs.coerceIn(0, 2_000)
+                        write(output, ByteArray(wav.rate * wav.channels * 2 * pause / 1000), wav.channels)
                     }
                 }
             }
