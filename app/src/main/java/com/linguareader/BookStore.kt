@@ -59,6 +59,17 @@ class BookStore private constructor(private val context: Context) {
         get() = prefs.getBoolean("context_resume", true)
         set(value) { prefs.edit().putBoolean("context_resume", value).apply() }
 
+    /**
+     * Whether to offer Replay: device narration with an engine other than Google's (the chosen one, or
+     * the phone's default). Engines like SherpaTTS/Piper occasionally garble a sentence; Google's don't.
+     */
+    fun replayUseful(context: android.content.Context): Boolean {
+        if (narrationSource != "device") return false
+        val engine = speechEngine ?: android.provider.Settings.Secure.getString(
+            context.contentResolver, android.provider.Settings.Secure.TTS_DEFAULT_SYNTH)
+        return engine != null && engine.isNotBlank() && engine != "com.google.android.tts"
+    }
+
     /** Device voices: render upcoming sentences to audio ahead of playback (RenderAhead). */
     var renderAhead: Boolean
         get() = prefs.getBoolean("render_ahead", true)
