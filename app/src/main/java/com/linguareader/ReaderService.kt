@@ -607,10 +607,11 @@ class ReaderService : MediaBrowserService() {
                 val word = Regex("(\\p{L}+)$").find(page.substring(cursor, end.range.first))?.value.orEmpty()
                 if (word.lowercase() in ABBREVIATIONS || (word.length == 1 && word[0].isUpperCase())) continue
             }
+            // Added pauses are off for now while the gapless stall is investigated (0 = none).
             val pause = when {
-                end.value.count { it == '\n' } >= 1 -> 650
-                end.value.contains('…') || end.value.contains("...") -> 450
-                else -> 320
+                end.value.count { it == '\n' } >= 1 -> PARAGRAPH_PAUSE_MS
+                end.value.contains('…') || end.value.contains("...") -> SENTENCE_PAUSE_MS
+                else -> SENTENCE_PAUSE_MS
             }
             if (page.substring(cursor, stop).isNotBlank()) sentences += Sentence(cursor, page.substring(cursor, stop), pause, true)
             cursor = stop
@@ -618,7 +619,7 @@ class ReaderService : MediaBrowserService() {
         val rest = page.substring(cursor)
         if (rest.isNotBlank()) {
             val complete = rest.trimEnd().lastOrNull()?.let { it in ".!?…»”\"'’)" } ?: true
-            sentences += Sentence(cursor, rest, 320, complete)
+            sentences += Sentence(cursor, rest, SENTENCE_PAUSE_MS, complete)
         }
         return sentences
     }
@@ -1010,6 +1011,10 @@ class ReaderService : MediaBrowserService() {
         session.release(); super.onDestroy()
     }
 }
+
+/** Silence FolioTone adds after a sentence / paragraph in gapless playback. Off for now. */
+private const val SENTENCE_PAUSE_MS = 0
+private const val PARAGRAPH_PAUSE_MS = 0
 
 /** End of a sentence (terminal punctuation, closing quotes, then space) or a paragraph break. */
 private val SENTENCE_END = Regex("[.!?…]+[»”\"'’)\\]]*\\s+|\\n\\s*\\n")
