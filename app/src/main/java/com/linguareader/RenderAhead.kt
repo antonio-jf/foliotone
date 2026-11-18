@@ -55,6 +55,9 @@ class RenderAhead(
         const val ID_PREFIX = "render:"
         private const val MAX_AHEAD = 24
         private const val SYNTHESIS_TIMEOUT_S = 90L
+        /** Playback ran dry and nothing new arrived for this long: give up and fall back. */
+        private const val STARVED_MS = 15_000L
+        private const val TAG = "FolioToneRender"
     }
 
     private class Rendered(val chunk: Chunk, val file: File)
@@ -73,6 +76,9 @@ class RenderAhead(
     @Volatile private var paused = false
     @Volatile private var track: AudioTrack? = null
     @Volatile private var framesWritten = 0L
+    @Volatile private var finishedRendering = false
+    /** Uptime when the player last ran out of audio while more was expected (0 while it has audio). */
+    private var starvedSince = 0L
 
     private val renderThread = Thread({ render() }, "FolioTone-render")
     private val playThread = Thread({ play() }, "FolioTone-play")
@@ -87,6 +93,18 @@ class RenderAhead(
                     boundaries.poll()
                     events.onChunkStarted(next.second)
                 }
+            }
+            // Watchdog: if everything written has been heard, nothing is queued and the voice is still
+            // working on the next piece for too long, fall back instead of staying silent.
+            val now = android.os.SystemClock.uptimeMillis()
+            val dry = !paused && !finishedRendering && ready.isEmpty() && (head == null || head >= framesWritten)
+            if (!dry) starvedSince = 0L
+            else if (starvedSince == 0L) starvedSince = now
+            else if (now - starvedSince > STARVED_MS) {
+                android.util.Log.w(TAG, "starved for ${now - starvedSince} ms waiting for the voice")
+                stop()
+                events.onFailed("no audio from the voice for ${STARVED_MS / 1000} s")
+                return
             }
             main.postDelayed(this, 120)
         }
@@ -128,6 +146,7 @@ class RenderAhead(
     }
 
     private fun fail(message: String) {
+        android.util.Log.w(TAG, "failed: $message")
         if (cancelled) return
         ready.clear()
         ready.offer(Failure(message))
@@ -142,9 +161,13 @@ class RenderAhead(
                 val file = File(folder, "$token-$index.wav")
                 val done = CountDownLatch(1)
                 pending[id] = done
+                val began = android.os.SystemClock.uptimeMillis()
+                android.util.Log.i(TAG, "render $id: ${chunk.text.length} chars, page ${chunk.section}/${chunk.page}@${chunk.start}")
                 val started = tts.synthesizeToFile(chunk.text, Bundle(), file, id)
-                if (started != TextToSpeech.SUCCESS) { fail("the voice refused to render text"); return }
+                if (started != TextToSpeech.SUCCESS) { fail("the voice refused to render text ($started)"); return }
                 if (!done.await(SYNTHESIS_TIMEOUT_S, TimeUnit.SECONDS)) { fail("the voice took too long"); return }
+                android.util.Log.i(TAG, "rendered $id in ${android.os.SystemClock.uptimeMillis() - began} ms: " +
+                    "ok=${outcome[id]} bytes=${file.length()}")
                 if (cancelled) return
                 if (outcome.remove(id) != true || !file.isFile || file.length() <= 44) {
                     file.delete()
@@ -153,6 +176,7 @@ class RenderAhead(
                 }
                 ready.put(Rendered(chunk, file))
             }
+            finishedRendering = true
             if (!cancelled) ready.put(End)
         } catch (e: InterruptedException) {
         } catch (error: Exception) {

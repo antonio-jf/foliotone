@@ -210,6 +210,7 @@ class ReaderService : MediaBrowserService() {
     /** Routes a TextToSpeech callback for a RenderAhead utterance (any thread). */
     private fun rendered(utteranceId: String?, success: Boolean): Boolean {
         if (utteranceId?.startsWith(RenderAhead.ID_PREFIX) != true) return false
+        android.util.Log.i("FolioToneRender", "callback $utteranceId success=$success renderer=${renderer != null}")
         renderer?.synthesisFinished(utteranceId, success)
         return true
     }
