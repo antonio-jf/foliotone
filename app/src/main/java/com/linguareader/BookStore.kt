@@ -353,6 +353,82 @@ class BookStore private constructor(private val context: Context) {
     }
 
     fun file(book: Book) = File(root, "${book.id}.epub")
+    fun fileFor(bookId: String) = File(root, "$bookId.epub")
+
+    /** Library order: 0 recently read, 1 title, 2 author, 3 progress. */
+    var librarySort: Int
+        get() = prefs.getInt("library_sort", 0).coerceIn(0, 3)
+        set(value) { prefs.edit().putInt("library_sort", value).apply() }
+
+    /** Library filter: 0 all, 1 in progress, 2 not started, 3 read, 4 narration downloaded. */
+    var libraryFilterChoice: Int
+        get() = prefs.getInt("library_filter", 0).coerceIn(0, 4)
+        set(value) { prefs.edit().putInt("library_filter", value).apply() }
+
+    /** Removes a book with its cover, saved narration, bookmarks and other per-book records. */
+    @Synchronized fun removeBook(bookId: String) {
+        require(bookId.matches(Regex("[a-f0-9]{64}"))) { "Invalid book" }
+        save(books().filter { it.id != bookId })
+        fileFor(bookId).delete()
+        File(covers, "$bookId.cover").delete()
+        checkedCovers.remove(bookId)
+        prefs.edit().apply {
+            prefs.all.keys.filter { it.endsWith("_$bookId") }.forEach { remove(it) }
+            if (lastOpenedId == bookId) remove("last_opened_id")
+        }.apply()
+    }
+
+    @Synchronized fun libraryJson(): String = if (index.isFile) index.readText() else "[]"
+
+    /** Backup restore: progress for books on this device; books whose file is here but missing from the list are added. */
+    @Synchronized fun restoreLibrary(json: String) {
+        val incoming = runCatching { JSONArray(json) }.getOrNull() ?: return
+        val current = books().associateBy { it.id }.toMutableMap()
+        for (i in 0 until incoming.length()) {
+            val o = incoming.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (!id.matches(Regex("[a-f0-9]{64}")) || !fileFor(id).isFile) continue
+            current[id] = Book(id, o.optString("title"), o.optString("author"), o.optString("language"),
+                o.optInt("section"), o.optInt("page"), o.optInt("sectionCount"), o.optInt("pagesInSection"),
+                if (o.has("gutenbergId") && !o.isNull("gutenbergId")) o.optInt("gutenbergId") else null,
+                o.optJSONArray("sectionPages")?.let { pages -> (0 until pages.length()).map { pages.optInt(it) } }.orEmpty())
+        }
+        save(current.values.toList())
+    }
+
+    /** Every setting, typed, for a backup (secrets are not in these preferences). */
+    fun exportSettings(): JSONObject = JSONObject().apply {
+        prefs.all.forEach { (key, value) ->
+            val typed = when (value) {
+                is Boolean -> JSONObject().put("t", "b").put("v", value)
+                is Int -> JSONObject().put("t", "i").put("v", value)
+                is Long -> JSONObject().put("t", "l").put("v", value)
+                is Float -> JSONObject().put("t", "f").put("v", value.toDouble())
+                is String -> JSONObject().put("t", "s").put("v", value)
+                is Set<*> -> JSONObject().put("t", "set").put("v", JSONArray(value.map { it.toString() }))
+                else -> null
+            }
+            if (typed != null) put(key, typed)
+        }
+    }
+
+    fun importSettings(settings: JSONObject) {
+        val editor = prefs.edit()
+        settings.keys().forEach { key ->
+            val typed = settings.optJSONObject(key) ?: return@forEach
+            when (typed.optString("t")) {
+                "b" -> editor.putBoolean(key, typed.optBoolean("v"))
+                "i" -> editor.putInt(key, typed.optInt("v"))
+                "l" -> editor.putLong(key, typed.optLong("v"))
+                "f" -> editor.putFloat(key, typed.optDouble("v").toFloat())
+                "s" -> editor.putString(key, typed.optString("v"))
+                "set" -> typed.optJSONArray("v")?.let { values ->
+                    editor.putStringSet(key, (0 until values.length()).map { values.optString(it) }.toSet())
+                }
+            }
+        }
+        editor.apply()
+    }
 
     @Synchronized fun coverFile(book: Book): File? {
         val output = File(covers, "${book.id}.cover")
