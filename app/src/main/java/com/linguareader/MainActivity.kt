@@ -1393,6 +1393,7 @@ class MainActivity : Activity() {
         settingRow(card, tr("Voice"), voiceStatus) { chooseVoice(settingsLanguage) }
         settingRow(card, tr("Refresh downloaded voices")) { refreshVoices() }
         settingRow(card, tr("Download more voices"), chevron = false) { installVoices() }
+        Speech.status?.let { settingNote(card, tr("Connection: {0}", it)) }
     }
 
     private fun showElevenSettings(card: LinearLayout) {
