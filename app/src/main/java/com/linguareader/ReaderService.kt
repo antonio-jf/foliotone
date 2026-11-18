@@ -83,6 +83,7 @@ class ReaderService : MediaBrowserService() {
     private var deviceFallback = false
     /** Gapless device-voice playback (RenderAhead); off for the session after it fails once. */
     @Volatile private var renderer: RenderAhead? = null
+    private var lastSpokenStart = -1
     /** Gapless playback is waiting for the voice (reported as buffering, so the time doesn't run on). */
     private var rendererWaiting = false
     // Sleep timer: a wall-clock time, or the end of the current section.
@@ -154,6 +155,7 @@ class ReaderService : MediaBrowserService() {
                         "sleep timer", "stop in 30 minutes", "temporizador", "dormir" -> { setSleep(30); return }
                         "sleep at end of chapter", "stop at end of chapter", "al final del capítulo" -> { setSleep(-1); return }
                         "cancel sleep timer", "cancelar temporizador" -> { setSleep(0); return }
+                        "report sentence", "report that", "reportar frase", "reportar" -> { reportSentence(); return }
                     }
                     val found = store.books().firstOrNull { query.isNullOrBlank() || it.title.contains(query, true) }
                     if (found != null) open(found.id, null, false, true)
@@ -209,6 +211,7 @@ class ReaderService : MediaBrowserService() {
                         pageStartedAt = SystemClock.elapsedRealtime()
                         deviceFraction = null
                         deviceChar = utterance.offset.takeIf { it > 0 }
+                        lastSpokenStart = -1
                     }
                 }
             }
@@ -219,6 +222,12 @@ class ReaderService : MediaBrowserService() {
                     if (playing && utterance != null && utterance.id == utteranceId) {
                         val text = book?.let { sections[it.section].pages[it.page] }.orEmpty()
                         deviceChar = utterance.offset + start
+                        val sentenceAt = sentenceStart(text, utterance.offset + start)
+                        if (sentenceAt != lastSpokenStart) {
+                            lastSpokenStart = sentenceAt
+                            val next = SENTENCE_END.find(text, (utterance.offset + start).coerceAtMost(text.length))
+                            spoken(sentenceAt, next?.range?.last?.plus(1) ?: text.length)
+                        }
                         deviceFraction = ((utterance.offset + start).toDouble() / text.length.coerceAtLeast(1)).coerceIn(0.0, 0.99)
                     }
                 }
@@ -262,6 +271,9 @@ class ReaderService : MediaBrowserService() {
             "PLAY" -> play()
             "REPLAY" -> replay()
             "BACK15" -> rewind(15)
+            "REPORT" -> reportSentence()
+            "READ_FROM" -> readFrom(intent.getIntExtra("section", -1), intent.getIntExtra("page", -1),
+                intent.getIntExtra("char", 0), intent.getBooleanExtra("play", true))
             "SLEEP" -> setSleep(intent.getIntExtra("minutes", 0))
             "BOOKMARK" -> addBookmark()
             "BOOKMARK_JUMP" -> {
@@ -450,6 +462,54 @@ class ReaderService : MediaBrowserService() {
         store.addBookmark(b.id, BookStore.Bookmark(b.section, b.page, start, snippet, System.currentTimeMillis()))
         Toast.makeText(this, tr("Bookmark added"), Toast.LENGTH_SHORT).show()
         notifyChildrenChanged("bookmarks")
+    }
+
+    /**
+     * Saves the sentence just read (as on the page and as given to the voice) for review in Listening
+     * settings → Reported sentences, where a pronunciation fix can be added or the list shared.
+     */
+    private fun reportSentence() {
+        val b = book ?: return
+        val language = NarrationVoices.locale(b.language).language
+        val piece = playedChunks.lastOrNull { it.text.isNotBlank() }
+        val (original, spokenText) = if (piece != null) {
+            val page = sections.getOrNull(piece.section)?.pages?.getOrNull(piece.page).orEmpty()
+            val end = if (piece.end > piece.start) piece.end.coerceAtMost(page.length) else page.length
+            page.substring(piece.start.coerceIn(0, page.length), end.coerceAtLeast(piece.start.coerceIn(0, page.length))).trim() to piece.text
+        } else {
+            val page = sections.getOrNull(b.section)?.pages?.getOrNull(b.page).orEmpty()
+            val start = sentenceStart(page, (deviceChar ?: 0).coerceIn(0, page.length))
+            val end = SENTENCE_END.find(page, start)?.range?.last?.plus(1) ?: page.length
+            val text = page.substring(start, end).trim()
+            text to SpeechText.normalize(text, language)
+        }
+        if (original.isBlank()) return
+        val engine = store.speechEngine ?: android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.TTS_DEFAULT_SYNTH) ?: "default"
+        store.saveReports(store.reports() + BookStore.Report(original, spokenText, b.title, engine, System.currentTimeMillis()))
+        Toast.makeText(this, tr("Sentence saved for review"), Toast.LENGTH_SHORT).show()
+    }
+
+    /** Tells the reader screen which part of the page is being read, so it can highlight it. */
+    private fun spoken(start: Int, end: Int) {
+        val b = book ?: return
+        sendBroadcast(Intent("com.linguareader.SPOKEN").setPackage(packageName)
+            .putExtra("id", b.id).putExtra("section", b.section).putExtra("page", b.page)
+            .putExtra("start", start).putExtra("end", end))
+    }
+
+    /** Reads from [char] of a page of the open book (tap a sentence, search results); [play] false only moves there. */
+    private fun readFrom(section: Int, page: Int, char: Int, play: Boolean) {
+        val b = book ?: return
+        if (section !in sections.indices) return
+        val target = PagePosition(section, page.coerceIn(sections[section].pages.indices))
+        val text = sections[target.section].pages[target.page]
+        clearBriefPause()
+        val wasPlaying = playing
+        haltAudio()
+        sleepSection = target.section
+        if (target != PagePosition(b.section, b.page)) moveTo(target)
+        resumeAt = target to sentenceStart(text, char.coerceIn(0, text.length))
+        if (play || wasPlaying) { playing = true; speak() } else state()
     }
 
     /** Opens [bookId] at [mark] and reads from there. */
@@ -716,6 +776,7 @@ class ReaderService : MediaBrowserService() {
                 deviceChar = chunk.start
                 deviceFraction = (chunk.start.toDouble() / length.coerceAtLeast(1)).coerceIn(0.0, 0.99)
                 if (pageChanged) state() else publishPlayback()
+                spoken(chunk.start, if (chunk.end > chunk.start) chunk.end else length)
             }
             override fun onFinished() {
                 if (token == generation && playing) finishBook()
@@ -761,10 +822,12 @@ class ReaderService : MediaBrowserService() {
                     if (rest != null) {
                         val tail = spoken(rest.text)
                         yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start,
-                            "$head $tail", rest.pauseMs, here.section, here.page, head.length + 1))
+                            "$head $tail", rest.pauseMs, here.section, here.page, head.length + 1,
+                            end = unfinished.start + unfinished.text.length, nextEnd = rest.start + rest.text.length))
                         index = 1
                     } else {
-                        yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start, head, unfinished.pauseMs))
+                        yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start, head, unfinished.pauseMs,
+                            end = unfinished.start + unfinished.text.length))
                     }
                 }
                 carry = null
@@ -777,7 +840,8 @@ class ReaderService : MediaBrowserService() {
                     }
                     val text = spoken(sentence.text)
                     if (text.isNotBlank()) {
-                        yield(RenderAhead.Chunk(here.section, here.page, sentence.start, text, sentence.pauseMs))
+                        yield(RenderAhead.Chunk(here.section, here.page, sentence.start, text, sentence.pauseMs,
+                            end = sentence.start + sentence.text.length))
                     }
                 }
                 from = 0
@@ -785,7 +849,7 @@ class ReaderService : MediaBrowserService() {
             }
             carry?.let { (carryPosition, unfinished) ->
                 yield(RenderAhead.Chunk(carryPosition.section, carryPosition.page, unfinished.start,
-                    spoken(unfinished.text), unfinished.pauseMs))
+                    spoken(unfinished.text), unfinished.pauseMs, end = unfinished.start + unfinished.text.length))
             }
         }
     }

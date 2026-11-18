@@ -49,7 +49,20 @@ object SpeechText {
     private val AND = mapOf("en" to "and", "es" to "y", "fr" to "et", "de" to "und", "it" to "e")
     private val PER_CENT = mapOf("en" to "percent", "es" to "por ciento", "fr" to "pour cent", "de" to "Prozent", "it" to "per cento")
 
-    fun normalize(text: String, language: String): String = currency(clean(text, language), language)
+    /** Words the user taught a different pronunciation (Listening settings → Pronunciations). */
+    @Volatile private var pronunciations: List<Pair<Regex, String>> = emptyList()
+
+    fun setPronunciations(rules: List<Pair<String, String>>) {
+        pronunciations = rules.filter { it.first.isNotBlank() && it.second.isNotBlank() }.map { (written, spoken) ->
+            Regex("(?<![\\p{L}\\p{N}])" + Regex.escape(written.trim()) + "(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE) to
+                Regex.escapeReplacement(spoken.trim())
+        }
+    }
+
+    private fun pronounce(text: String): String =
+        pronunciations.fold(text) { result, (pattern, spoken) -> pattern.replace(result, spoken) }
+
+    fun normalize(text: String, language: String): String = currency(clean(pronounce(text), language), language)
 
     /** Punctuation and markup that voices read literally or garble (see the class comment). */
     fun clean(text: String, language: String): String {

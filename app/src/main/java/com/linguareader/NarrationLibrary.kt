@@ -59,6 +59,20 @@ object NarrationLibrary {
     fun bytesUsed(context: Context): Long =
         folders(context).sumOf { folder -> folder.walkTopDown().filter { it.isFile }.sumOf { it.length() } }
 
+    /** Space used by [bookId]'s saved narration (server and ElevenLabs). */
+    fun bytesFor(context: Context, bookId: String): Long =
+        folders(context).sumOf { File(it, bookId).walkTopDown().filter { file -> file.isFile }.sumOf { file -> file.length() } }
+
+    /** Deletes [bookId]'s saved narration from both sources. */
+    fun deleteFor(context: Context, bookId: String) {
+        runCatching { ServerAudio.remove(context, bookId) }
+        runCatching { ElevenLabs(context).removeBookDownload(bookId) }
+        folders(context).forEach { File(it, bookId).deleteRecursively() }
+        val store = BookStore.get(context)
+        store.setNarrationStatus("server", bookId, null)
+        store.setNarrationStatus("elevenlabs", bookId, null)
+    }
+
     /** Deletes every saved narration page from this device. API keys and server settings stay. */
     fun deleteAll(context: Context) {
         ServerAudio.clearAll(context)

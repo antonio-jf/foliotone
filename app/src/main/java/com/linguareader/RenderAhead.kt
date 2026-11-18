@@ -43,7 +43,9 @@ class RenderAhead(
      * [nextPage]; the page turn is reported [splitAt] characters into [text].
      */
     data class Chunk(val section: Int, val page: Int, val start: Int, val text: String,
-                     val pauseMs: Int = 140, val nextSection: Int = -1, val nextPage: Int = -1, val splitAt: Int = 0)
+                     val pauseMs: Int = 140, val nextSection: Int = -1, val nextPage: Int = -1, val splitAt: Int = 0,
+                     /** Where the piece ends in the page text (for highlighting); [nextEnd] on the next page. */
+                     val end: Int = -1, val nextEnd: Int = -1)
 
     interface Events {
         fun onChunkStarted(chunk: Chunk)
@@ -226,7 +228,7 @@ class RenderAhead(
                             // Turn the page roughly where the sentence crosses it.
                             val frames = wav.pcm.size.toLong() / (2 * wav.channels)
                             boundaries.add(startFrame + frames * chunk.splitAt / chunk.text.length to
-                                Chunk(chunk.nextSection, chunk.nextPage, 0, ""))
+                                Chunk(chunk.nextSection, chunk.nextPage, 0, "", end = chunk.nextEnd))
                         }
                         write(output, wav.pcm, wav.channels)
                         // Silence in whole frames: an odd byte count is rejected by AudioTrack.

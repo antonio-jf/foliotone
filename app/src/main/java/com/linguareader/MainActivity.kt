@@ -48,6 +48,9 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
     private val importRequest = 10
     private val folderRequest = 11
+    private val backupRequest = 12
+    private val restoreRequest = 13
+    private var backupWithBooks = true
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private lateinit var store: BookStore
@@ -63,6 +66,20 @@ class MainActivity : Activity() {
     private var previewEpoch = 0
     private var pendingVoiceRefresh = false
     private var inSettings = false
+    /** Full-screen reading: only the page and a slim control row. */
+    private var focusMode = false
+    /** The reading page on screen and the part of it being narrated (highlighted). */
+    private var pageView: TextView? = null
+    private var pageKey: Triple<String, Int, Int>? = null
+    private var spokenRange: Pair<Triple<String, Int, Int>, IntRange>? = null
+    private val spokenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val id = intent?.getStringExtra("id") ?: return
+            val key = Triple(id, intent.getIntExtra("section", -1), intent.getIntExtra("page", -1))
+            spokenRange = key to (intent.getIntExtra("start", 0) until intent.getIntExtra("end", 0))
+            highlightSpoken(scrollTo = true)
+        }
+    }
     private var settingsLanguage = "en"
     private val coverCache = LruCache<String, Bitmap>(12)
     private var selectedId: String? = null
@@ -85,7 +102,6 @@ class MainActivity : Activity() {
     private var browsingGutenberg = false
     private var browsingRatings = false
     private var ratingsFilter = 0
-    private var libraryFilter = 0
     private var gutenbergQuery = ""
     private val gutenbergResults = mutableListOf<GutenbergBook>()
     private var gutenbergNext: String? = null
@@ -272,6 +288,9 @@ class MainActivity : Activity() {
         val gutenbergFilter = IntentFilter(GutenbergDownloadService.UPDATE)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(gutenbergReceiver, gutenbergFilter, RECEIVER_NOT_EXPORTED)
         else registerReceiver(gutenbergReceiver, gutenbergFilter)
+        val spokenFilter = IntentFilter("com.linguareader.SPOKEN")
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(spokenReceiver, spokenFilter, RECEIVER_NOT_EXPORTED)
+        else registerReceiver(spokenReceiver, spokenFilter)
         // Focus loss and remote controls can change playback while this screen is stopped.
         // Subscribe first, then ask for a snapshot so no background change is missed.
         command("GET_STATE")
@@ -288,6 +307,7 @@ class MainActivity : Activity() {
         unregisterReceiver(stateReceiver)
         unregisterReceiver(offlineReceiver)
         unregisterReceiver(gutenbergReceiver)
+        unregisterReceiver(spokenReceiver)
         super.onStop()
     }
     override fun onDestroy() {
@@ -393,15 +413,66 @@ class MainActivity : Activity() {
     }
 
     private fun bookStatusOptions(book: Book) {
+        val narration = NarrationLibrary.bytesFor(this, book.id)
         choiceSheet(book.title, listOf(
             MenuChoice(if (store.isRead(book.id)) tr("Mark as unread") else tr("Mark as read")),
-            MenuChoice(tr("Rate book")), MenuChoice(tr("Open book"))
+            MenuChoice(tr("Rate book")), MenuChoice(tr("Open book")),
+            MenuChoice(tr("Storage"), tr("Book {0} · narration {1}", megabytes(store.file(book).length()), megabytes(narration)))
         )) { index ->
             when (index) {
                 0 -> { store.setRead(book.id, !store.isRead(book.id)); refreshCurrentScreen() }
                 1 -> rateBook(book)
                 2 -> openBook(book)
+                3 -> bookStorage(book, narration)
             }
+        }
+    }
+
+    private fun megabytes(bytes: Long) = if (bytes <= 0) tr("none") else "%.1f MB".format(bytes / 1_048_576.0)
+
+    private fun bookStorage(book: Book, narration: Long) {
+        val choices = mutableListOf<Pair<MenuChoice, () -> Unit>>()
+        if (narration > 0) choices += MenuChoice(tr("Delete this book's narration"),
+            tr("Frees {0}. The book and your progress stay.", megabytes(narration))) to {
+            confirm(tr("Delete the saved narration of “{0}”?", book.title), tr("Delete narration")) {
+                if (OfflineDownloadService.activeBookId == book.id) command("PAUSE")
+                worker.execute {
+                    NarrationLibrary.deleteFor(this, book.id)
+                    main.post { toast(tr("Narration deleted")); refreshCurrentScreen() }
+                }
+            }
+        }
+        choices += MenuChoice(tr("Remove book from library"),
+            tr("Deletes the book, its narration, bookmarks and progress from this device")) to {
+            confirm(tr("Remove “{0}” from this device?", book.title), tr("Remove book")) {
+                if (serviceBookId == book.id) command("STOP")
+                worker.execute {
+                    NarrationLibrary.deleteFor(this, book.id)
+                    store.removeBook(book.id)
+                    main.post {
+                        if (selectedId == book.id) selectedId = null
+                        toast(tr("Book removed")); showHome()
+                    }
+                }
+            }
+        }
+        choiceSheet(tr("Storage · {0}", book.title), choices.map { it.first }) { choices[it].second() }
+    }
+
+    /** A two-option sheet: [action] runs only after the user picks [yes]. */
+    private fun confirm(question: String, yes: String, action: () -> Unit) {
+        choiceSheet(question, listOf(MenuChoice(yes), MenuChoice(tr("Cancel")))) { if (it == 0) action() }
+    }
+
+    private fun startBackup() {
+        choiceSheet(tr("Back up library"), listOf(
+            MenuChoice(tr("Books, progress and settings"), tr("Everything needed to restore on a new phone")),
+            MenuChoice(tr("Progress and settings only"), tr("Small file; books must be added again"))
+        )) { index ->
+            backupWithBooks = index == 0
+            val name = "FolioTone-backup-" + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()) + ".zip"
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/zip").putExtra(Intent.EXTRA_TITLE, name), backupRequest)
         }
     }
 
@@ -519,6 +590,7 @@ class MainActivity : Activity() {
         extras.forEach { (key, value) -> when (value) {
             is String -> intent.putExtra(key, value)
             is Int -> intent.putExtra(key, value)
+            is Boolean -> intent.putExtra(key, value)
         } }
         startService(intent)
     }
@@ -703,16 +775,22 @@ class MainActivity : Activity() {
             gap(5)
             addText("${books.size} ${if (books.size == 1) "book" else "books"}", 13f, muted)
             gap(12)
-            val filters = listOf(tr("All books"), tr("Unread"), tr("Read"))
+            val filters = listOf(tr("All books"), tr("In progress"), tr("Not started"), tr("Read"), tr("Narration downloaded"))
+            val sorts = listOf(tr("Recently read"), tr("Title"), tr("Author"), tr("Progress"))
             val libraryControls = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            libraryControls.addView(secondary("${filters[libraryFilter]}  ▾") {
-                choiceSheet(tr("Library view"), filters.map { MenuChoice(it) }, libraryFilter) { index ->
-                    libraryFilter = index; showHome()
+            libraryControls.addView(compact(secondary("${filters[store.libraryFilterChoice]}  ▾") {
+                choiceSheet(tr("Show"), filters.map { MenuChoice(it) }, store.libraryFilterChoice) { index ->
+                    store.libraryFilterChoice = index; showHome()
                 }
-            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            }, 42), LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
+            libraryControls.addView(compact(secondary("⇅ ${sorts[store.librarySort]}") {
+                choiceSheet(tr("Sort by"), sorts.map { MenuChoice(it) }, store.librarySort) { index ->
+                    store.librarySort = index; showHome()
+                }
+            }, 42), LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
             fun viewToggle(label: String, grid: Boolean): TextView {
                 val selected = store.libraryGrid == grid
                 val action = { setLibraryGrid(grid) }
@@ -726,8 +804,17 @@ class MainActivity : Activity() {
             libraryControls.addView(viewToggle(tr("Grid"), true), LinearLayout.LayoutParams(dp(64), -2))
             content.addView(libraryControls)
             gap(10)
-            val visible = books.filter { libraryFilter == 0 || store.isRead(it.id) == (libraryFilter == 2) }
-            if (visible.isEmpty()) addText(if (libraryFilter == 2) tr("No read books yet.") else tr("No unread books."), 14f, muted)
+            val visible = sortedLibrary(books.filter { book ->
+                val read = store.isRead(book.id)
+                when (store.libraryFilterChoice) {
+                    1 -> !read && (book.section > 0 || book.page > 0)
+                    2 -> !read && book.section == 0 && book.page == 0
+                    3 -> read
+                    4 -> runCatching { NarrationLibrary.badge(this, book) }.getOrNull() != null
+                    else -> true
+                }
+            })
+            if (visible.isEmpty()) addText(tr("No books match “{0}”.", filters[store.libraryFilterChoice]), 14f, muted)
             if (store.libraryGrid) showLibraryGrid(visible)
             else visible.forEach { book ->
                 val bookRow = LinearLayout(this).apply {
@@ -765,6 +852,16 @@ class MainActivity : Activity() {
             if (store.folderUri == null) startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), folderRequest)
             else scanFolder()
         })
+    }
+
+    private fun sortedLibrary(books: List<Book>): List<Book> = when (store.librarySort) {
+        1 -> books.sortedBy { it.title.lowercase() }
+        2 -> books.sortedWith(compareBy({ it.author.ifBlank { "\uFFFF" }.lowercase() }, { it.title.lowercase() }))
+        3 -> books.sortedByDescending { progress(it) }
+        else -> {
+            val order = store.recentBooks(Int.MAX_VALUE).mapIndexed { index, book -> book.id to index }.toMap()
+            books.sortedBy { order[it.id] ?: Int.MAX_VALUE }
+        }
     }
 
     /** "🎧 Server narration downloaded" (accent) or a partial/other-voice note (muted); null if none saved. */
@@ -1317,6 +1414,20 @@ class MainActivity : Activity() {
         }
 
         val reading = settingsGroup(tr("Reading"))
+        val sizes = listOf(16f to tr("Small"), 19f to tr("Medium"), 22f to tr("Large"), 26f to tr("Extra large"))
+        val size = sizes.minByOrNull { kotlin.math.abs(it.first - store.readerTextSize) } ?: sizes[1]
+        settingRow(reading, tr("Text size"), size.second) {
+            choiceSheet(tr("Text size"), sizes.map { MenuChoice(it.second) }, sizes.indexOf(size)) {
+                store.readerTextSize = sizes[it].first; showSettings()
+            }
+        }
+        val spacings = listOf(3f to tr("Tight"), 7f to tr("Normal"), 12f to tr("Relaxed"))
+        val spacing = spacings.minByOrNull { kotlin.math.abs(it.first - store.readerLineSpacing) } ?: spacings[1]
+        settingRow(reading, tr("Line spacing"), spacing.second) {
+            choiceSheet(tr("Line spacing"), spacings.map { MenuChoice(it.second) }, spacings.indexOf(spacing)) {
+                store.readerLineSpacing = spacings[it].first; showSettings()
+            }
+        }
         switchRow(reading, tr("Resume one page earlier"), tr("Keeps a little context when reopening a book."),
             store.contextResume) { store.contextResume = it }
         switchRow(reading, tr("Automatically mark finished books as read"),
@@ -1334,6 +1445,13 @@ class MainActivity : Activity() {
             if (AppUpdates.isDevelopmentBuild(this)) tr("Off for builds from Android Studio; you can still check by hand.")
             else tr("Checks GitHub twice a day; you confirm each install."),
             AppUpdates.isAutomatic(this)) { AppUpdates.setAutomatic(this, it) }
+
+        val backup = settingsGroup(tr("Backup"))
+        settingRow(backup, tr("Back up library"), tr("Books, reading progress, bookmarks and settings to a file")) { startBackup() }
+        settingRow(backup, tr("Restore from a backup"), tr("API keys and downloaded narration are not included")) {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*").putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream")), restoreRequest)
+        }
 
         val storage = settingsGroup(tr("Storage"))
         val storageValue = settingRow(storage, tr("Delete all downloaded narration"), tr("Checking saved audio…"),
@@ -1368,6 +1486,11 @@ class MainActivity : Activity() {
         settingRow(card, tr("Voice"), voiceStatus) { chooseVoice(settingsLanguage) }
         settingRow(card, tr("Refresh downloaded voices")) { refreshVoices() }
         settingRow(card, tr("Download more voices"), chevron = false) { installVoices() }
+        val fixes = store.pronunciations().size
+        settingRow(card, tr("Pronunciations"), if (fixes == 0) tr("Teach the voice how to say a word")
+            else tr("{0} words", fixes)) { managePronunciations() }
+        val reports = store.reports().size
+        if (reports > 0) settingRow(card, tr("Reported sentences"), tr("{0} saved for review", reports)) { manageReports() }
         switchRow(card, tr("Gapless playback"),
             tr("Prepares the next sentences and page in advance, so voices like SherpaTTS read without pauses."),
             store.renderAhead) {
@@ -2065,6 +2188,7 @@ class MainActivity : Activity() {
         val sectionIndex = (sessionSection ?: book.section).coerceIn(parsed.sections.indices)
         val section = parsed.sections[sectionIndex]
         val pageIndex = (sessionPage ?: book.page).coerceIn(section.pages.indices)
+        if (focusMode) { showFocusReader(book, sectionIndex, pageIndex, section.pages[pageIndex]); return }
         val bookProgress = progress(book.copy(
             section = sectionIndex,
             page = pageIndex,
@@ -2152,12 +2276,142 @@ class MainActivity : Activity() {
         gap(16)
         addText(tr("READING PAGE"), 11f, accent).typeface = Typeface.DEFAULT_BOLD
         gap(8)
-        content.addView(text(section.pages[pageIndex], 19f, palette.paperInk).apply {
+        content.addView(readingPage(book, sectionIndex, pageIndex, section.pages[pageIndex]))
+    }
+
+    /**
+     * The page text: sized from the reading settings, the sentence being narrated highlighted, and a tap
+     * on a sentence reads from there.
+     */
+    private fun readingPage(book: Book, sectionIndex: Int, pageIndex: Int, page: String): TextView {
+        val view = text(page, store.readerTextSize, palette.paperInk).apply {
             typeface = Typeface.SERIF
-            setLineSpacing(dp(7).toFloat(), 1.06f)
+            setLineSpacing(dp(store.readerLineSpacing.toInt()).toFloat(), 1.06f)
             setPadding(dp(16), dp(18), dp(16), dp(20))
             background = rounded(palette.paper, 16)
+            isClickable = true
+            contentDescription = tr("Reading page. Tap a sentence to read from there.")
+        }
+        val tap = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: android.view.MotionEvent) = true
+            override fun onSingleTapUp(e: android.view.MotionEvent): Boolean {
+                val offset = view.getOffsetForPosition(e.x, e.y)
+                if (offset < 0) return false
+                command("READ_FROM", "section" to sectionIndex, "page" to pageIndex, "char" to offset)
+                return true
+            }
         })
+        view.setOnTouchListener { _, event -> tap.onTouchEvent(event); false }
+        pageView = view
+        pageKey = Triple(book.id, sectionIndex, pageIndex)
+        view.post { highlightSpoken(scrollTo = playing) }
+        return view
+    }
+
+    /** Applies the narrated range to the page on screen, scrolling it into view if it is off screen. */
+    private fun highlightSpoken(scrollTo: Boolean) {
+        val view = pageView ?: return
+        val (key, range) = spokenRange ?: return
+        if (key != pageKey) return
+        val text = view.text.toString()
+        val start = range.first.coerceIn(0, text.length)
+        val end = (range.last + 1).coerceIn(start, text.length)
+        val styled = android.text.SpannableString(text)
+        if (end > start) styled.setSpan(android.text.style.BackgroundColorSpan((accent and 0x00FFFFFF) or 0x40000000),
+            start, end, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        view.text = styled
+        if (!scrollTo || end <= start) return
+        val layout = view.layout ?: return
+        val lineTop = view.top + view.paddingTop + layout.getLineTop(layout.getLineForOffset(start))
+        val visibleTop = scroll.scrollY
+        val visibleBottom = visibleTop + scroll.height
+        if (lineTop < visibleTop + dp(40) || lineTop > visibleBottom - dp(120)) {
+            scroll.smoothScrollTo(0, (lineTop - scroll.height / 3).coerceAtLeast(0))
+        }
+    }
+
+    /** Full-screen reading: page text with a slim control row. */
+    private fun showFocusReader(book: Book, sectionIndex: Int, pageIndex: Int, page: String) {
+        content.removeAllViews()
+        val listen = compact(button(playbackLabel()) { command(if (playing) "PAUSE" else "PLAY") }, 40)
+        playbackButton = listen
+        content.addView(rowOf(compact(secondary(tr("✕")) { focusMode = false; showReader() }, 40).apply {
+                contentDescription = tr("Leave full screen")
+            },
+            compact(secondary(tr("◀")) { command("PREVIOUS") }, 40).apply { contentDescription = tr("Back") },
+            compact(secondary(tr("⟲ 15 s")) { command("BACK15") }, 40),
+            listen,
+            compact(secondary(tr("▶")) { command("NEXT") }, 40).apply { contentDescription = tr("Next") }))
+        gap(10)
+        content.addView(readingPage(book, sectionIndex, pageIndex, page))
+    }
+
+    /** Finds [query] in the book (ignoring case and accents) and lists where it appears. */
+    private fun searchBook(book: Book) {
+        val parsed = cachedBook?.takeIf { cachedBookId == book.id } ?: return
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(24), dp(22), dp(24))
+            background = rounded(surface, 22)
+        }
+        panel.addView(text(tr("Search in this book"), 22f).apply { typeface = Typeface.SERIF })
+        val input = EditText(this).apply {
+            hint = tr("Words to find")
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            setTextColor(ink); setHintTextColor(muted)
+            textSize = 15f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(surfaceRaised, 12)
+        }
+        panel.addView(input, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        fun fold(value: String) = java.text.Normalizer.normalize(value.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}"), "")
+        fun run() {
+            val query = fold(input.text.toString().trim())
+            if (query.length < 2) return
+            dialog.dismiss()
+            data class Hit(val section: Int, val page: Int, val char: Int, val snippet: String)
+            val hits = mutableListOf<Hit>()
+            outer@ for ((s, section) in parsed.sections.withIndex()) for ((p, text) in section.pages.withIndex()) {
+                // Folding keeps every character's position (accents become combining marks that are removed),
+                // so search a folded copy built per character.
+                val folded = text.map { fold(it.toString()).firstOrNull() ?: it }.joinToString("")
+                var from = 0
+                while (true) {
+                    val at = folded.indexOf(query, from)
+                    if (at < 0) break
+                    val begin = (at - 40).coerceAtLeast(0)
+                    val snippet = (if (begin > 0) "…" else "") + text.substring(begin, (at + query.length + 50).coerceAtMost(text.length))
+                        .replace(Regex("\\s+"), " ") + "…"
+                    hits += Hit(s, p, at, snippet)
+                    if (hits.size >= 60) break@outer
+                    from = at + query.length
+                }
+            }
+            if (hits.isEmpty()) { toast(tr("No matches for “{0}”", input.text.toString().trim())); return }
+            choiceSheet(tr("{0} matches", if (hits.size >= 60) "60+" else hits.size.toString()), hits.map {
+                MenuChoice(it.snippet, tr("{0} · page {1}", parsed.sections[it.section].title, it.page + 1))
+            }) { index ->
+                val hit = hits[index]
+                sessionSection = hit.section
+                sessionPage = hit.page
+                spokenRange = Triple(book.id, hit.section, hit.page) to (hit.char until hit.char + query.length)
+                command("READ_FROM", "section" to hit.section, "page" to hit.page, "char" to hit.char, "play" to false)
+                showReader()
+                pageView?.post { highlightSpoken(scrollTo = true) }
+            }
+        }
+        input.setOnEditorActionListener { _, _, _ -> run(); true }
+        panel.addView(button(tr("Search")) { run() }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+        dialog.setContentView(panel)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.9).toInt(), -2)
+        dialog.show()
+        input.requestFocus()
     }
 
     private fun playbackLabel() = if (playing) tr("Ⅱ  Pause") else tr("▶  Listen")
@@ -2421,12 +2675,18 @@ class MainActivity : Activity() {
                 }
             }
         )
+        actions += MenuChoice(tr("Full-screen reading"), tr("Only the page and the playback buttons")) to {
+            focusMode = true; showReader()
+        }
+        actions += MenuChoice(tr("Search in this book")) to { searchBook(book) }
         actions += MenuChoice(tr("Sleep timer"), when {
             sleepAtSectionEnd -> tr("Stops at the end of this chapter")
             sleepAt > 0 -> tr("Stops at {0}", java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(sleepAt)))
             else -> tr("Off")
         }) to { chooseSleep() }
         actions += MenuChoice(tr("Add bookmark"), tr("Saves the sentence being read")) to { command("BOOKMARK") }
+        if (store.replayUseful(this)) actions += MenuChoice(tr("Report a garbled sentence"),
+            tr("Saves the last sentence so it can be fixed")) to { command("REPORT") }
         val marks = store.bookmarks(book.id)
         if (marks.isNotEmpty()) actions += MenuChoice(tr("Bookmarks"), tr("{0} saved", marks.size)) to { showBookmarks(book) }
         if (cloud) actions += MenuChoice(tr("Regenerate this page"),
@@ -2435,6 +2695,115 @@ class MainActivity : Activity() {
             settingsLanguage = book.language.ifBlank { "en" }; showSettings()
         }
         choiceSheet(tr("Listening options"), actions.map { it.first }) { actions[it].second() }
+    }
+
+    private fun managePronunciations() {
+        val rules = store.pronunciations()
+        val choices = listOf(MenuChoice(tr("＋  Add a word"), tr("For phone voices: how a word is written and how to say it"))) +
+            rules.map { (written, spoken) -> MenuChoice(written, tr("said as “{0}”", spoken)) }
+        choiceSheet(tr("Pronunciations"), choices) { index ->
+            if (index == 0) { editPronunciation(null, ""); return@choiceSheet }
+            val rule = rules[index - 1]
+            choiceSheet(rule.first, listOf(MenuChoice(tr("Listen")), MenuChoice(tr("Edit")), MenuChoice(tr("Delete")))) { action ->
+                when (action) {
+                    0 -> sayAloud(rule.second)
+                    1 -> editPronunciation(rule, rule.first)
+                    else -> { store.savePronunciations(rules - rule); command("VOICE_CHANGED"); showSettings() }
+                }
+            }
+        }
+    }
+
+    /** Add or change a pronunciation; [written] pre-fills the word (from a reported sentence). */
+    private fun editPronunciation(existing: Pair<String, String>?, written: String) {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(24), dp(22), dp(24))
+            background = rounded(surface, 22)
+        }
+        panel.addView(text(tr("Pronunciation"), 22f).apply { typeface = Typeface.SERIF })
+        panel.addView(text(tr("Write the word as it appears in books, then spell it the way it should sound. Applies to phone voices."), 13f, muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        fun field(hint: String, value: String) = EditText(this).apply {
+            this.hint = hint
+            setText(value)
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(ink); setHintTextColor(muted)
+            textSize = 15f
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(surfaceRaised, 12)
+        }
+        val writtenField = field(tr("As written, e.g. Kordestani"), existing?.first ?: written)
+        val spokenField = field(tr("Say it as, e.g. Kor-des-tah-nee"), existing?.second ?: "")
+        panel.addView(writtenField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        panel.addView(spokenField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        panel.addView(rowOf(secondary(tr("Listen")) { sayAloud(spokenField.text.toString()) },
+            button(tr("Save")) {
+                val from = writtenField.text.toString().trim()
+                val to = spokenField.text.toString().trim()
+                if (from.isEmpty() || to.isEmpty()) { toast(tr("Fill in both fields")); return@button }
+                val rules = store.pronunciations().filterNot { it == existing || it.first.equals(from, true) } + (from to to)
+                store.savePronunciations(rules)
+                command("VOICE_CHANGED")
+                dialog.dismiss()
+                toast(tr("Saved: “{0}” is now said as “{1}”", from, to))
+                if (inSettings) showSettings()
+            }), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        dialog.setContentView(panel)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.9).toInt(), -2)
+        dialog.setOnDismissListener { stopVoicePreview() }
+        dialog.show()
+    }
+
+    /** Says [text] with the phone voice chosen for the settings language (pronunciation test). */
+    private fun sayAloud(text: String) {
+        val tts = previewTts
+        if (text.isBlank()) return
+        if (tts == null || !previewReady) { toast(tr("Loading voices…")); return }
+        stopVoicePreview()
+        if (playing) command("PAUSE")
+        if (!previewAudioFocus.acquire()) { toast(tr("Audio is in use by another app. Try again shortly.")); return }
+        val id = "voice-preview-${++previewSequence}"
+        previewUtterance = id
+        tts.setAudioAttributes(PlaybackAudioFocus.attributes)
+        NarrationVoices.choose(tts, settingsLanguage, store.voiceName(settingsLanguage))?.let { tts.setVoice(it) }
+        tts.setSpeechRate(store.speechRate)
+        if (tts.speak(SpeechText.normalize(text, settingsLanguage), TextToSpeech.QUEUE_FLUSH, null, id) != TextToSpeech.SUCCESS) stopVoicePreview()
+    }
+
+    private fun manageReports() {
+        val reports = store.reports().reversed()
+        if (reports.isEmpty()) { toast(tr("No reported sentences")); return }
+        val choices = listOf(MenuChoice(tr("Share all"), tr("Send the list, e.g. to look at the text together")),
+            MenuChoice(tr("Clear the list"))) +
+            reports.map { MenuChoice(it.text.take(120), tr("{0} · {1}", it.book, it.engine)) }
+        choiceSheet(tr("Reported sentences"), choices) { index ->
+            when (index) {
+                0 -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(Intent.EXTRA_SUBJECT, tr("FolioTone: sentences read wrongly"))
+                    .putExtra(Intent.EXTRA_TEXT, reports.joinToString("\n\n") {
+                        "${it.book} (${it.engine})\n" + tr("Page text: {0}", it.text) + "\n" + tr("Given to the voice: {0}", it.spoken)
+                    }), tr("Share")))
+                1 -> confirm(tr("Clear all reported sentences?"), tr("Clear")) {
+                    store.saveReports(emptyList()); if (inSettings) showSettings()
+                }
+                else -> {
+                    val report = reports[index - 2]
+                    choiceSheet(report.text.take(80), listOf(MenuChoice(tr("Fix a word's pronunciation")),
+                        MenuChoice(tr("Listen to it again")), MenuChoice(tr("Delete")))) { action ->
+                        when (action) {
+                            0 -> editPronunciation(null, "")
+                            1 -> sayAloud(report.text)
+                            else -> { store.saveReports(store.reports() - report); if (inSettings) showSettings() }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun chooseSleep() {
@@ -2593,6 +2962,31 @@ class MainActivity : Activity() {
             folderRequest -> {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 store.folderUri = uri.toString(); scanFolder()
+            }
+            backupRequest -> {
+                toast(tr("Saving backup…"))
+                val withBooks = backupWithBooks
+                worker.execute {
+                    val result = runCatching { Backup.export(this, uri, withBooks) }
+                    main.post {
+                        result.onSuccess { toast(tr("Backup saved: {0} books", it.books)) }
+                            .onFailure { toast(tr("Backup failed: {0}", it.message ?: "")) }
+                    }
+                }
+            }
+            restoreRequest -> confirm(tr("Restore this backup?"), tr("Restore")) {
+                toast(tr("Restoring…"))
+                if (playing) command("PAUSE")
+                worker.execute {
+                    val result = runCatching { Backup.restore(this, uri) }
+                    main.post {
+                        result.onSuccess {
+                            toast(tr("Restored {0} books and your settings", it.books))
+                            I18n.apply(this, store.appLanguage)
+                            recreate()
+                        }.onFailure { toast(tr("Restore failed: {0}", it.message ?: "")) }
+                    }
+                }
             }
         }
     }

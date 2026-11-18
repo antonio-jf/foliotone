@@ -51,6 +51,7 @@ class BookStore private constructor(private val context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     init {
+        SpeechText.setPronunciations(pronunciations())
         root.listFiles()?.filter { it.name.startsWith("import-") && it.name.endsWith(".epub") }
             ?.forEach(File::delete)
     }
@@ -145,6 +146,44 @@ class BookStore private constructor(private val context: Context) {
         val own = bookId?.let { "speech_rate_$it" }?.takeIf { prefs.contains(it) }
         return prefs.getFloat(own ?: "speech_rate", 0.94f).coerceIn(0.75f, 1.2f)
     }
+
+    /** Pronunciation fixes for device voices: (as written, as spoken). */
+    fun pronunciations(): List<Pair<String, String>> = runCatching {
+        val array = JSONArray(prefs.getString("pronunciations", "[]"))
+        (0 until array.length()).map { array.getJSONObject(it) }.map { it.optString("written") to it.optString("spoken") }
+    }.getOrDefault(emptyList())
+
+    fun savePronunciations(rules: List<Pair<String, String>>) {
+        val array = JSONArray()
+        rules.forEach { (written, spoken) -> array.put(JSONObject().put("written", written).put("spoken", spoken)) }
+        prefs.edit().putString("pronunciations", array.toString()).apply()
+        SpeechText.setPronunciations(rules)
+    }
+
+    /** A sentence the user marked as read wrongly: the page text, what the voice was given, and where. */
+    data class Report(val text: String, val spoken: String, val book: String, val engine: String, val created: Long)
+
+    fun reports(): List<Report> = runCatching {
+        val array = JSONArray(prefs.getString("reports", "[]"))
+        (0 until array.length()).map { array.getJSONObject(it) }.map {
+            Report(it.optString("text"), it.optString("spoken"), it.optString("book"), it.optString("engine"), it.optLong("created"))
+        }
+    }.getOrDefault(emptyList())
+
+    fun saveReports(reports: List<Report>) {
+        val array = JSONArray()
+        reports.takeLast(100).forEach { array.put(JSONObject().put("text", it.text).put("spoken", it.spoken)
+            .put("book", it.book).put("engine", it.engine).put("created", it.created)) }
+        prefs.edit().putString("reports", array.toString()).apply()
+    }
+
+    /** Reading page text size (sp) and extra line spacing (dp). */
+    var readerTextSize: Float
+        get() = prefs.getFloat("reader_text_size", 19f).coerceIn(14f, 30f)
+        set(value) { prefs.edit().putFloat("reader_text_size", value).apply() }
+    var readerLineSpacing: Float
+        get() = prefs.getFloat("reader_line_spacing", 7f).coerceIn(0f, 20f)
+        set(value) { prefs.edit().putFloat("reader_line_spacing", value).apply() }
 
     /** Gapless playback: multiplier for the pauses after sentences and paragraphs (0 = none). */
     var pauseScale: Float
@@ -345,6 +384,87 @@ class BookStore private constructor(private val context: Context) {
     }
 
     fun file(book: Book) = File(root, "${book.id}.epub")
+    fun fileFor(bookId: String) = File(root, "$bookId.epub")
+
+    /** Library order: 0 recently read, 1 title, 2 author, 3 progress. */
+    var librarySort: Int
+        get() = prefs.getInt("library_sort", 0).coerceIn(0, 3)
+        set(value) { prefs.edit().putInt("library_sort", value).apply() }
+
+    /** Library filter: 0 all, 1 in progress, 2 not started, 3 read, 4 narration downloaded. */
+    var libraryFilterChoice: Int
+        get() = prefs.getInt("library_filter", 0).coerceIn(0, 4)
+        set(value) { prefs.edit().putInt("library_filter", value).apply() }
+
+    /** Removes a book with its cover, saved narration, bookmarks and other per-book records. */
+    @Synchronized fun removeBook(bookId: String) {
+        require(bookId.matches(Regex("[a-f0-9]{64}"))) { "Invalid book" }
+        save(books().filter { it.id != bookId })
+        fileFor(bookId).delete()
+        File(covers, "$bookId.cover").delete()
+        checkedCovers.remove(bookId)
+        prefs.edit().apply {
+            prefs.all.keys.filter { it.endsWith("_$bookId") }.forEach { remove(it) }
+            if (lastOpenedId == bookId) remove("last_opened_id")
+        }.apply()
+    }
+
+    @Synchronized fun libraryJson(): String = if (index.isFile) index.readText() else "[]"
+
+    /** Backup restore: progress for books on this device; books whose file is here but missing from the list are added. */
+    @Synchronized fun restoreLibrary(json: String) {
+        val incoming = runCatching { JSONArray(json) }.getOrNull() ?: return
+        val current = books().associateBy { it.id }.toMutableMap()
+        for (i in 0 until incoming.length()) {
+            val o = incoming.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (!id.matches(Regex("[a-f0-9]{64}")) || !fileFor(id).isFile) continue
+            current[id] = Book(id, o.optString("title"), o.optString("author"), o.optString("language"),
+                o.optInt("section"), o.optInt("page"), o.optInt("sectionCount"), o.optInt("pagesInSection"),
+                if (o.has("gutenbergId") && !o.isNull("gutenbergId")) o.optInt("gutenbergId") else null,
+                o.optJSONArray("sectionPages")?.let { pages -> (0 until pages.length()).map { pages.optInt(it) } }.orEmpty())
+        }
+        save(current.values.toList())
+    }
+
+    /** Every setting, typed, for a backup (secrets are not in these preferences). */
+    fun exportSettings(): JSONObject = JSONObject().apply {
+        prefs.all.forEach { (key, value) ->
+            val typed = when (value) {
+                is Boolean -> JSONObject().put("t", "b").put("v", value)
+                is Int -> JSONObject().put("t", "i").put("v", value)
+                is Long -> JSONObject().put("t", "l").put("v", value)
+                is Float -> JSONObject().put("t", "f").put("v", value.toDouble())
+                is String -> JSONObject().put("t", "s").put("v", value)
+                is Set<*> -> JSONObject().put("t", "set").put("v", JSONArray(value.map { it.toString() }))
+                else -> null
+            }
+            if (typed != null) put(key, typed)
+        }
+    }
+
+    fun importSettings(settings: JSONObject) {
+        restoreSettings(settings)
+        SpeechText.setPronunciations(pronunciations())
+    }
+
+    private fun restoreSettings(settings: JSONObject) {
+        val editor = prefs.edit()
+        settings.keys().forEach { key ->
+            val typed = settings.optJSONObject(key) ?: return@forEach
+            when (typed.optString("t")) {
+                "b" -> editor.putBoolean(key, typed.optBoolean("v"))
+                "i" -> editor.putInt(key, typed.optInt("v"))
+                "l" -> editor.putLong(key, typed.optLong("v"))
+                "f" -> editor.putFloat(key, typed.optDouble("v").toFloat())
+                "s" -> editor.putString(key, typed.optString("v"))
+                "set" -> typed.optJSONArray("v")?.let { values ->
+                    editor.putStringSet(key, (0 until values.length()).map { values.optString(it) }.toSet())
+                }
+            }
+        }
+        editor.apply()
+    }
 
     @Synchronized fun coverFile(book: Book): File? {
         val output = File(covers, "${book.id}.cover")
@@ -536,6 +656,7 @@ object Epub {
             manifest[item.getAttribute("id")] = item.getAttribute("href")
         }
         val base = opfPath.substringBeforeLast('/', "")
+        val toc = runCatching { tableOfContents(opf, base, ::read) }.getOrDefault(emptyMap())
         val sections = mutableListOf<Section>()
         val spine = opf.getElementsByTagNameNS("*", "itemref")
         require(spine.length <= 2_000) { tr("EPUB has too many sections") }
@@ -561,13 +682,56 @@ object Epub {
             val pages = paginate(text)
             totalPages += pages.size
             require(totalPages <= 12_000) { tr("EPUB has too many pages") }
-            if (pages.isNotEmpty()) sections += Section(heading.ifBlank { "Section ${sections.size + 1}" }, pages)
+            // Title: the book's table of contents, else the first heading, else a short first line.
+            val firstLine = paragraphs.firstOrNull()?.takeIf { it.length in 2..60 && it.last() !in ".,;:!?" }
+            val title = toc[path]?.takeIf { it.isNotBlank() } ?: heading.ifBlank { firstLine ?: "" }
+            if (pages.isNotEmpty()) sections += Section(title.ifBlank { "Section ${sections.size + 1}" }, pages)
         }
         require(sections.isNotEmpty()) { tr("This EPUB has no readable text") }
         val declared = meta("language").substringBefore('-').lowercase()
         ParsedBook(meta("title").ifBlank { file.nameWithoutExtension }, meta("creator"),
             if (declared in languages) declared else inferLanguage(sections.take(3).flatMap { it.pages.take(2) }.joinToString(" ")),
             sections)
+    }
+
+    /**
+     * Chapter titles from the EPUB's own table of contents, by content file: the EPUB 3 navigation
+     * document (manifest item with properties="nav") or the EPUB 2 NCX (spine toc="…"). The first entry
+     * pointing into a file names it.
+     */
+    private fun tableOfContents(opf: org.w3c.dom.Document, base: String, read: (String, Int) -> ByteArray): Map<String, String> {
+        val titles = linkedMapOf<String, String>()
+        val items = opf.getElementsByTagNameNS("*", "item")
+        val manifest = (0 until items.length).map { items.item(it) as Element }
+        fun add(file: String, href: String, title: String) {
+            val clean = title.replace(Regex("\\s+"), " ").trim()
+            if (clean.isEmpty() || href.isBlank()) return
+            val target = resolve(file.substringBeforeLast('/', ""), href.substringBefore('#'))
+            titles.putIfAbsent(target, clean)
+        }
+        manifest.firstOrNull { "nav" in it.getAttribute("properties").split(' ') }?.let { nav ->
+            val path = resolve(base, nav.getAttribute("href"))
+            val doc = Jsoup.parse(read(path, 2 * 1024 * 1024).toString(Charsets.UTF_8))
+            val list = doc.getElementsByTag("nav").firstOrNull { "toc" in it.attr("epub:type").split(' ') }
+                ?: doc.getElementsByTag("nav").firstOrNull()
+            list?.getElementsByTag("a")?.forEach { link -> add(path, link.attr("href"), link.text()) }
+        }
+        if (titles.isEmpty()) {
+            val spine = opf.getElementsByTagNameNS("*", "spine").item(0) as? Element
+            val ncxId = spine?.getAttribute("toc").orEmpty()
+            val ncx = manifest.firstOrNull { it.getAttribute("id") == ncxId && ncxId.isNotEmpty() }
+                ?: manifest.firstOrNull { it.getAttribute("media-type") == "application/x-dtbncx+xml" }
+            ncx?.let { item ->
+                val path = resolve(base, item.getAttribute("href"))
+                val doc = Jsoup.parse(read(path, 2 * 1024 * 1024).toString(Charsets.UTF_8), "", org.jsoup.parser.Parser.xmlParser())
+                doc.getElementsByTag("navPoint").forEach { point ->
+                    val label = point.getElementsByTag("navLabel").firstOrNull()?.getElementsByTag("text")?.firstOrNull()?.text().orEmpty()
+                    val src = point.getElementsByTag("content").firstOrNull()?.attr("src").orEmpty()
+                    add(path, src, label)
+                }
+            }
+        }
+        return titles
     }
 
     private fun resolve(base: String, href: String): String {
