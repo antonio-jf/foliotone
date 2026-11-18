@@ -34,7 +34,7 @@ FolioTone checks GitHub's latest release when it opens (at most every 6 hours) a
 
 ### In the car (Android Auto)
 
-FolioTone shows three tabs in Android Auto. **Continue** lists recently read books with their cover, place and progress, and tapping one resumes it. **Library** is a cover grid, and each book opens its chapters with the current one marked. **Chapters** lists the chapters of the current book. Search finds books by title or author. The playback screen has Section start, plus Replay for non-Google device voices.
+FolioTone shows three tabs in Android Auto. **Continue** lists recently read books with their cover, place and progress, and tapping one resumes it. **Library** is a cover grid, and each book opens its chapters with the current one marked. **Chapters** lists the chapters of the current book. Saying "play <title> on FolioTone" finds a book by voice. The playback screen has Section start, plus Replay for non-Google device voices.
 
 Android Auto only shows apps installed from the Play Store unless you allow others. On the phone, open **Android Auto settings**, tap **Version** about 10 times to unlock developer settings, then use the ⋮ menu → **Developer settings** → **Unknown sources**. Without this, tapping FolioTone in the car asks you to use the phone.
 

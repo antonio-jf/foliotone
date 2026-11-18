@@ -1063,8 +1063,8 @@ class ReaderService : MediaBrowserService() {
     //
     // Media apps can't draw their own car screens; Android Auto builds them from this browse tree. Root
     // children become tabs: Continue (recent books, resume where you left off), Library (cover grid,
-    // each book opens its chapters) and Chapters (the current book). Search finds books by title or
-    // author. Covers come from CoverProvider; progress shows as a bar via the completion extras.
+    // each book opens its chapters) and Chapters (the current book). Books are found by voice through
+    // onPlayFromSearch ("play <title> on FolioTone"). Covers come from CoverProvider; progress shows as a bar via the completion extras.
 
     private companion object Car {
         const val CONTENT_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
@@ -1073,7 +1073,6 @@ class ReaderService : MediaBrowserService() {
         const val STYLE_SINGLE_ITEM = "android.media.browse.CONTENT_STYLE_SINGLE_ITEM_HINT"
         const val STYLE_LIST = 1
         const val STYLE_GRID = 2
-        const val SEARCH_SUPPORTED = "android.media.browse.SEARCH_SUPPORTED"
         const val PLAYBACK_STATUS = "android.media.extra.PLAYBACK_STATUS"
         const val STATUS_NOT_PLAYED = 0
         const val STATUS_PARTIAL = 1
@@ -1090,7 +1089,6 @@ class ReaderService : MediaBrowserService() {
             putBoolean(CONTENT_STYLE_SUPPORTED, true)
             putInt(STYLE_BROWSABLE, STYLE_GRID)
             putInt(STYLE_PLAYABLE, STYLE_LIST)
-            putBoolean(SEARCH_SUPPORTED, true)
         })
     }
 
@@ -1166,18 +1164,6 @@ class ReaderService : MediaBrowserService() {
                 }
             }.getOrDefault(mutableListOf())
             result.sendResult(items)
-        }
-    }
-
-    override fun onSearch(query: String, extras: Bundle?, result: Result<MutableList<MediaBrowser.MediaItem>>) {
-        result.detach()
-        browseWorker.execute {
-            val words = query.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
-            val found = store.books().filter { b ->
-                val haystack = "${b.title} ${b.author}".lowercase()
-                words.all { it in haystack }
-            }.map { resumeItem(it) }.toMutableList()
-            result.sendResult(found)
         }
     }
 
