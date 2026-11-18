@@ -968,8 +968,8 @@ class ReaderService : MediaBrowserService() {
                 PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH)
             .setState(if (cloudLoading) PlaybackState.STATE_BUFFERING else if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
                 mediaPosition(), if (playing && !cloudLoading) 1f else 0f, SystemClock.elapsedRealtime())
-            .addCustomAction("replay", tr("Replay"), R.drawable.ic_foliotone_monochrome)
             .addCustomAction("section_start", tr("Start section"), R.drawable.ic_foliotone_monochrome)
+        if (store.replayUseful(this)) builder.addCustomAction("replay", tr("Replay"), R.drawable.ic_foliotone_monochrome)
         if (error != null) builder.setErrorMessage(error)
         session.setPlaybackState(builder.build())
     }
@@ -1009,7 +1009,7 @@ class ReaderService : MediaBrowserService() {
         fun action(name: String, label: String, icon: Int) = Notification.Action.Builder(icon, label,
             PendingIntent.getService(this, name.hashCode(), Intent(this, ReaderService::class.java).setAction(name),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
-        return Notification.Builder(this, channel)
+        val builder = Notification.Builder(this, channel)
             .setSmallIcon(R.drawable.ic_foliotone_monochrome).setContentTitle(book?.title ?: "FolioTone")
             .setContentText(sectionDescription())
             .setSubText(book?.author)
@@ -1019,9 +1019,9 @@ class ReaderService : MediaBrowserService() {
             .addAction(action("PREVIOUS", tr("Back"), R.drawable.ic_foliotone_monochrome))
             .addAction(action(if (playing) "PAUSE" else "PLAY", if (playing) tr("Pause") else tr("Play"), R.drawable.ic_foliotone_monochrome))
             .addAction(action("NEXT", tr("Next"), R.drawable.ic_foliotone_monochrome))
-            .addAction(action("REPLAY", tr("Replay"), R.drawable.ic_foliotone_monochrome))
             .setStyle(Notification.MediaStyle().setMediaSession(session.sessionToken).setShowActionsInCompactView(0, 1, 2))
-            .build()
+        if (store.replayUseful(this)) builder.addAction(action("REPLAY", tr("Replay"), R.drawable.ic_foliotone_monochrome))
+        return builder.build()
     }
 
     override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot = BrowserRoot("root", null)

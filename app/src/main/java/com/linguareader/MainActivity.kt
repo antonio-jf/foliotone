@@ -2127,9 +2127,11 @@ class MainActivity : Activity() {
             listen,
             compact(secondary(tr("Next  ▶")) { command("NEXT") }, 44)))
         gap(6)
-        content.addView(rowOf(compact(secondary(tr("↺ Replay")) { command("REPLAY") }, 38),
-            compact(secondary(tr("Contents")) { showContents(book, parsed, sectionIndex, pageIndex) }, 38),
-            compact(secondary(tr("Voice & options")) { readerOptions(book) }, 38)))
+        val contents = compact(secondary(tr("Contents")) { showContents(book, parsed, sectionIndex, pageIndex) }, 38)
+        val options = compact(secondary(tr("Voice & options")) { readerOptions(book) }, 38)
+        content.addView(if (store.replayUseful(this))
+            rowOf(compact(secondary(tr("↺ Replay")) { command("REPLAY") }, 38), contents, options)
+            else rowOf(contents, options))
         if (store.narrationSource == "elevenlabs" || store.narrationSource == "server") showOfflineAudio(book, parsed)
         gap(16)
         addText(tr("READING PAGE"), 11f, accent).typeface = Typeface.DEFAULT_BOLD
