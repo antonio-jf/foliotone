@@ -49,6 +49,15 @@ interface Speech {
         /** Engines whose direct connection failed in this process: use TextToSpeech for them. */
         private val failed = mutableSetOf<String>()
 
+        /** What the last connection attempt did, shown in Listening settings for diagnosis. */
+        @Volatile var status: String? = null
+            private set
+
+        internal fun report(message: String) {
+            status = message
+            android.util.Log.i("FolioToneSpeech", message)
+        }
+
         /** The phone's preferred engine (Settings → Text-to-speech), if set. */
         fun defaultEngine(context: Context): String? =
             Settings.Secure.getString(context.contentResolver, Settings.Secure.TTS_DEFAULT_SYNTH)?.takeIf { it.isNotBlank() }
@@ -68,8 +77,18 @@ interface Speech {
          */
         fun create(context: Context, engine: String?, onInit: (Int) -> Unit): Speech {
             val target = engine ?: defaultEngine(context)
-            val service = target?.takeIf { it !in failed && !platformAccepts(context, it) }
+            val accepted = target != null && platformAccepts(context, target)
+            val service = target?.takeIf { it !in failed && !accepted }
                 ?.let { services(context, it, 0).firstOrNull()?.serviceInfo }
+            when {
+                target == null -> report("No engine chosen and no phone default: Android TextToSpeech")
+                accepted -> report("$target: Android TextToSpeech accepts it, used normally")
+                target in failed -> report("$target: direct connection failed earlier (${status ?: "?"}); Android TextToSpeech")
+                service == null -> report("$target: TextToSpeech refuses it and no TTS service was found; Android TextToSpeech")
+                else -> report("$target: TextToSpeech refuses it; connecting directly to ${service.name}" +
+                    (service.permission?.let { " (service requires $it)" } ?: "") +
+                    if (!service.exported) " (service not exported)" else "")
+            }
             if (target != null && service != null) {
                 return EngineSpeech(context.applicationContext, ComponentName(service.packageName, service.name), onInit) {
                     synchronized(failed) { failed += target }
@@ -141,6 +160,7 @@ class EngineSpeech(
     @Volatile private var initialised = false
     @Volatile private var closed = false
     private var bound = false
+    @Volatile private var lastError: String? = null
 
     /** Our identity for the engine (TextToSpeech uses its callback object the same way). */
     private val callback = object : Binder() {
@@ -166,27 +186,34 @@ class EngineSpeech(
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            if (binder == null) { failDirect(); return }
+            if (binder == null) { failDirect("engine returned no service"); return }
             service = binder
             Thread {
-                val ready = runCatching { setUp() }.getOrDefault(false)
+                val setup = runCatching { setUp() }
                 if (!initialised) {
-                    if (ready) { initialised = true; onInit(TextToSpeech.SUCCESS) } else failDirect()
+                    if (setup.getOrDefault(false)) {
+                        initialised = true
+                        val count = runCatching { voices?.size }.getOrNull()
+                        Speech.report("${component.packageName}: connected directly, ${count ?: "?"} voices")
+                        onInit(TextToSpeech.SUCCESS)
+                    } else failDirect("setup failed: ${setup.exceptionOrNull()?.message ?: lastError ?: "registering the callback was refused"}")
                 }
             }.start()
         }
         override fun onServiceDisconnected(name: ComponentName?) { service = null }
-        override fun onBindingDied(name: ComponentName?) { service = null; if (!initialised) failDirect() }
-        override fun onNullBinding(name: ComponentName?) { failDirect() }
+        override fun onBindingDied(name: ComponentName?) { service = null; if (!initialised) failDirect("binding died") }
+        override fun onNullBinding(name: ComponentName?) { failDirect("engine returned no service") }
     }
 
     init {
-        bound = runCatching {
+        val binding = runCatching {
             context.bindService(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE).setComponent(component),
                 connection, Context.BIND_AUTO_CREATE)
-        }.getOrDefault(false)
-        if (!bound) failDirect()
-        else main.postDelayed({ if (!initialised && fallback == null) failDirect() }, CONNECT_TIMEOUT_MS)
+        }
+        bound = binding.getOrDefault(false)
+        if (!bound) failDirect(binding.exceptionOrNull()?.let { "bind refused: ${it.javaClass.simpleName}: ${it.message}" }
+            ?: "bind refused (bindService returned false)")
+        else main.postDelayed({ if (!initialised && fallback == null) failDirect("no answer within 5 s") }, CONNECT_TIMEOUT_MS)
     }
 
     /** Register for callbacks and pick the engine's default language and voice, as TextToSpeech does. */
@@ -206,10 +233,11 @@ class EngineSpeech(
         return true
     }
 
-    private fun failDirect() {
+    private fun failDirect(reason: String) {
         if (fallback != null || closed) return
         synchronized(this) {
             if (fallback != null) return
+            Speech.report("${component.packageName}: direct connection failed: $reason; using Android TextToSpeech")
             onDirectFailed()
             unbind()
             service = null
@@ -234,10 +262,11 @@ class EngineSpeech(
         return try {
             data.writeInterfaceToken(SERVICE)
             data.write()
-            if (!binder.transact(code, data, reply, 0)) return null
+            if (!binder.transact(code, data, reply, 0)) { lastError = "call $code not handled"; return null }
             reply.readException()
             reply.read()
         } catch (error: Exception) {
+            lastError = "call $code: ${error.javaClass.simpleName}: ${error.message}"
             null
         } finally {
             data.recycle(); reply.recycle()
