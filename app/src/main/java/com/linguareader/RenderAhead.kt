@@ -194,12 +194,17 @@ class RenderAhead(
                                 Chunk(chunk.nextSection, chunk.nextPage, 0, ""))
                         }
                         write(output, wav.pcm, wav.channels)
-                        val pause = chunk.pauseMs.coerceIn(0, 2_000)
-                        write(output, ByteArray(wav.rate * wav.channels * 2 * pause / 1000), wav.channels)
+                        // Silence in whole frames: an odd byte count is rejected by AudioTrack.
+                        val pauseFrames = wav.rate.toLong() * chunk.pauseMs.coerceIn(0, 2_000) / 1000
+                        write(output, ByteArray((pauseFrames * wav.channels * 2).toInt()), wav.channels)
                     }
                 }
             }
         } catch (e: InterruptedException) {
+        } catch (error: Exception) {
+            // Never leave the reader waiting on a dead player: report it so it falls back to normal speech.
+            val message = error.message ?: error.javaClass.simpleName
+            main.post { if (!cancelled) events.onFailed("playback stopped: $message") }
         } finally {
             track?.let { runCatching { it.pause(); it.flush(); it.release() } }
             track = null
@@ -208,13 +213,15 @@ class RenderAhead(
     }
 
     private fun write(output: AudioTrack, bytes: ByteArray, channels: Int) {
+        val frame = 2 * channels
+        val size = bytes.size - bytes.size % frame
         var offset = 0
-        while (offset < bytes.size && !cancelled) {
-            val written = output.write(bytes, offset, minOf(8192, bytes.size - offset))
+        while (offset < size && !cancelled) {
+            val written = output.write(bytes, offset, minOf(8192, size - offset))
             if (written < 0) throw IllegalStateException("audio write failed ($written)")
             if (written == 0) { Thread.sleep(20); continue }
             offset += written
-            framesWritten += written / (2 * channels)
+            framesWritten += written / frame
         }
     }
 
