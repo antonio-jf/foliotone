@@ -786,11 +786,28 @@ class ReaderService : MediaBrowserService() {
                 rendererWaiting = waiting
                 publishPlayback()
             }
-            override fun onFailed(message: String) {
+            override fun onFailed(message: String, at: RenderAhead.Chunk?) {
                 if (token != generation) return
                 android.util.Log.w("FolioTone", "Gapless playback failed ($message); using normal speech")
                 renderFailed = true
+                // Continue with normal speech from the piece that failed (or the one playing), not the page start.
+                val from = at ?: playedChunks.lastOrNull { it.text.isNotEmpty() }
+                if (from != null && from.section in sections.indices) {
+                    val position = PagePosition(from.section, from.page.coerceIn(sections[from.section].pages.indices))
+                    haltAudio()
+                    if (book?.let { PagePosition(it.section, it.page) } != position) moveTo(position)
+                    resumeAt = position to from.start
+                }
                 if (playing) speak()
+            }
+            override fun onSkipped(chunk: RenderAhead.Chunk) {
+                // Keep a record, so it can be looked at under Reported sentences.
+                val b = book ?: return
+                val page = sections.getOrNull(chunk.section)?.pages?.getOrNull(chunk.page).orEmpty()
+                val end = if (chunk.end > chunk.start) chunk.end.coerceAtMost(page.length) else page.length
+                val original = page.substring(chunk.start.coerceIn(0, page.length), end.coerceAtLeast(chunk.start.coerceIn(0, page.length))).trim()
+                store.saveReports(store.reports() + BookStore.Report(original.ifBlank { chunk.text }, tr("(skipped: the voice could not read it) {0}", chunk.text),
+                    b.title, store.speechEngine ?: "default", System.currentTimeMillis()))
             }
         }).start()
     }
@@ -991,6 +1008,7 @@ class ReaderService : MediaBrowserService() {
         deviceFallback = false
         renderer?.stop()
         renderer = null
+        spoken(-1, -1) // no highlight until the new playback reports its place
         rendererWaiting = false
         pausedRenderer = false
         playedChunks.clear()

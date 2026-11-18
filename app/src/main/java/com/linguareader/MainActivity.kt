@@ -76,7 +76,14 @@ class MainActivity : Activity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val id = intent?.getStringExtra("id") ?: return
             val key = Triple(id, intent.getIntExtra("section", -1), intent.getIntExtra("page", -1))
-            spokenRange = key to (intent.getIntExtra("start", 0) until intent.getIntExtra("end", 0))
+            val start = intent.getIntExtra("start", 0)
+            if (start < 0) {
+                // Playback restarted or can't follow the text: drop the highlight.
+                spokenRange = null
+                pageView?.let { it.text = it.text.toString() }
+                return
+            }
+            spokenRange = key to (start until intent.getIntExtra("end", 0))
             highlightSpoken(scrollTo = true)
         }
     }
