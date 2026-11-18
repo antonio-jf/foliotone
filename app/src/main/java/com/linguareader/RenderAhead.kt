@@ -50,7 +50,10 @@ class RenderAhead(
     interface Events {
         fun onChunkStarted(chunk: Chunk)
         fun onFinished()
-        fun onFailed(message: String)
+        /** Gapless playback stopped; [at] is the piece it could not render (null: the one playing). */
+        fun onFailed(message: String, at: Chunk?)
+        /** A piece the voice could not render even after retries was left out. */
+        fun onSkipped(chunk: Chunk) {}
         /** True while playback waits for the voice to finish the next piece. */
         fun onBuffering(waiting: Boolean) {}
     }
@@ -62,11 +65,12 @@ class RenderAhead(
         /** Playback ran dry and nothing new arrived for this long: give up and fall back. */
         private const val STARVED_MS = 60_000L
         private const val TAG = "FolioToneRender"
+        private const val TIMEOUT = "the voice took too long"
     }
 
     private class Rendered(val chunk: Chunk, val file: File)
     private object End
-    private class Failure(val message: String)
+    private class Failure(val message: String, val at: Chunk?)
     private class Wav(val rate: Int, val channels: Int, val pcm: ByteArray)
 
     private val main = Handler(Looper.getMainLooper())
@@ -110,7 +114,7 @@ class RenderAhead(
             else if (now - starvedSince > STARVED_MS) {
                 android.util.Log.w(TAG, "starved for ${now - starvedSince} ms waiting for the voice")
                 stop()
-                events.onFailed("no audio from the voice for ${STARVED_MS / 1000} s")
+                events.onFailed("no audio from the voice for ${STARVED_MS / 1000} s", null)
                 return
             }
             main.postDelayed(this, 120)
@@ -158,42 +162,68 @@ class RenderAhead(
         pending.remove(id)?.countDown()
     }
 
-    private fun fail(message: String) {
+    /**
+     * Ends rendering after the pieces already prepared: they still play, then [Events.onFailed] reports
+     * [at], the piece that could not be rendered, so the reader continues from there.
+     */
+    private fun fail(message: String, at: Chunk?) {
         android.util.Log.w(TAG, "failed: $message")
         if (cancelled) return
-        ready.clear()
-        ready.offer(Failure(message))
+        try { ready.put(Failure(message, at)) } catch (e: InterruptedException) { }
     }
+
+    /** Renders [text] into [file]. Null when it worked, otherwise why not. */
+    private fun attempt(id: String, text: String, file: File): String? {
+        val done = CountDownLatch(1)
+        pending[id] = done
+        val began = android.os.SystemClock.uptimeMillis()
+        android.util.Log.i(TAG, "render $id: ${text.length} chars")
+        val started = tts.synthesizeToFile(text, Bundle(), file, id)
+        if (started != TextToSpeech.SUCCESS) { pending.remove(id); return "the voice refused to render text ($started)" }
+        if (!done.await(SYNTHESIS_TIMEOUT_S, TimeUnit.SECONDS)) { pending.remove(id); return TIMEOUT }
+        android.util.Log.i(TAG, "rendered $id in ${android.os.SystemClock.uptimeMillis() - began} ms: " +
+            "ok=${outcome[id]} bytes=${file.length()}")
+        if (outcome.remove(id) == true && file.isFile && file.length() > 44) return null
+        file.delete()
+        return "the voice could not render a sentence"
+    }
+
+    /** The text with only letters, digits and plain punctuation, for a second try at a piece that failed. */
+    private fun simplified(text: String) = text.replace(Regex("[^\\p{L}\\p{N}\\s.,;:!?'-]"), " ")
+        .replace(Regex("\\s+"), " ").trim()
 
     private fun render() {
         var index = 0
+        var failuresInARow = 0
         try {
             while (!cancelled && chunks.hasNext()) {
                 val chunk = chunks.next()
                 val id = "$ID_PREFIX$token:${index++}"
                 val file = File(folder, "$token-$index.wav")
-                val done = CountDownLatch(1)
-                pending[id] = done
-                val began = android.os.SystemClock.uptimeMillis()
-                android.util.Log.i(TAG, "render $id: ${chunk.text.length} chars, page ${chunk.section}/${chunk.page}@${chunk.start}")
-                val started = tts.synthesizeToFile(chunk.text, Bundle(), file, id)
-                if (started != TextToSpeech.SUCCESS) { fail("the voice refused to render text ($started)"); return }
-                if (!done.await(SYNTHESIS_TIMEOUT_S, TimeUnit.SECONDS)) { fail("the voice took too long"); return }
-                android.util.Log.i(TAG, "rendered $id in ${android.os.SystemClock.uptimeMillis() - began} ms: " +
-                    "ok=${outcome[id]} bytes=${file.length()}")
-                if (cancelled) return
-                if (outcome.remove(id) != true || !file.isFile || file.length() <= 44) {
-                    file.delete()
-                    fail("the voice could not render a sentence")
-                    return
+                android.util.Log.i(TAG, "piece $id: page ${chunk.section}/${chunk.page}@${chunk.start}")
+                // One failed piece should not stop the book: try again, then with plain punctuation.
+                var reason = attempt(id, chunk.text, file)
+                if (reason != null && reason != TIMEOUT && !cancelled) reason = attempt("${id}r", chunk.text, file)
+                val plain = simplified(chunk.text)
+                if (reason != null && reason != TIMEOUT && !cancelled && plain.isNotBlank() && plain != chunk.text) {
+                    reason = attempt("${id}s", plain, file)
                 }
+                if (cancelled) return
+                if (reason != null) {
+                    failuresInARow++
+                    if (reason == TIMEOUT || failuresInARow >= 3) { fail(reason, chunk); return }
+                    android.util.Log.w(TAG, "skipping $id after retries: $reason")
+                    main.post { if (!cancelled) events.onSkipped(chunk) }
+                    continue
+                }
+                failuresInARow = 0
                 ready.put(Rendered(chunk, file))
             }
             finishedRendering = true
             if (!cancelled) ready.put(End)
         } catch (e: InterruptedException) {
         } catch (error: Exception) {
-            fail(error.message ?: error.javaClass.simpleName)
+            fail(error.message ?: error.javaClass.simpleName, null)
         }
     }
 
@@ -207,18 +237,19 @@ class RenderAhead(
                         return
                     }
                     is Failure -> {
-                        main.post { if (!cancelled) events.onFailed(item.message) }
+                        drain()
+                        main.post { if (!cancelled) events.onFailed(item.message, item.at) }
                         return
                     }
                     is Rendered -> {
                         val wav = readWav(item.file)
                         item.file.delete()
                         if (wav == null) {
-                            main.post { if (!cancelled) events.onFailed("unreadable audio from the voice") }
+                            main.post { if (!cancelled) events.onFailed("unreadable audio from the voice", null) }
                             return
                         }
                         val output = trackFor(wav) ?: run {
-                            main.post { if (!cancelled) events.onFailed("could not open the audio output") }
+                            main.post { if (!cancelled) events.onFailed("could not open the audio output", null) }
                             return
                         }
                         val chunk = item.chunk
@@ -241,7 +272,7 @@ class RenderAhead(
         } catch (error: Exception) {
             // Never leave the reader waiting on a dead player: report it so it falls back to normal speech.
             val message = error.message ?: error.javaClass.simpleName
-            main.post { if (!cancelled) events.onFailed("playback stopped: $message") }
+            main.post { if (!cancelled) events.onFailed("playback stopped: $message", null) }
         } finally {
             track?.let { runCatching { it.pause(); it.flush(); it.release() } }
             track = null
