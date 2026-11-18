@@ -56,7 +56,7 @@ class RenderAhead(
         private const val MAX_AHEAD = 24
         private const val SYNTHESIS_TIMEOUT_S = 90L
         /** Playback ran dry and nothing new arrived for this long: give up and fall back. */
-        private const val STARVED_MS = 15_000L
+        private const val STARVED_MS = 60_000L
         private const val TAG = "FolioToneRender"
     }
 
