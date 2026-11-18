@@ -485,6 +485,7 @@ object Epub {
             val html = read(path, 8 * 1024 * 1024).toString(Charsets.UTF_8)
             val doc = Jsoup.parse(html)
             doc.select("script,style,nav,head,svg").remove()
+            removeNoteReferences(doc)
             val body = doc.body()
             val heading = body.selectFirst("h1,h2,h3")?.text()?.trim().orEmpty()
             val paragraphs = body.select("h1,h2,h3,h4,p,li,blockquote")
@@ -516,6 +517,22 @@ object Epub {
             }
         }
         return java.net.URLDecoder.decode(stack.joinToString("/"), "UTF-8")
+    }
+
+    /**
+     * Footnote and endnote reference marks: the small numbers after a word that link to a note. Read
+     * aloud they come out as random numbers, so they are left out of the text (the notes themselves stay).
+     * Recognised: links marked as note references (epub:type="noteref", role="doc-noteref"), and
+     * superscripts or in-book links whose text is only a short number or symbol ("10", "[3]", "*", "†").
+     */
+    private fun removeNoteReferences(doc: org.jsoup.nodes.Document) {
+        val mark = Regex("^[\\[(]?(\\d{1,3}|[*†‡§¶]{1,3}|[ivxlc]{1,5})[\\])]?$")
+        // Plain attribute checks rather than selectors: a selector problem must never stop a book opening.
+        doc.allElements.filter { element ->
+            "noteref" in element.attr("epub:type").split(' ') || "doc-noteref" in element.attr("role").split(' ') ||
+                (element.tagName() == "sup" && mark.matches(element.text().trim())) ||
+                (element.tagName() == "a" && '#' in element.attr("href") && mark.matches(element.text().trim()))
+        }.forEach { if (it.parent() != null) it.remove() }
     }
 
     private fun paginate(text: String): List<String> {
