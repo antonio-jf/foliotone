@@ -474,6 +474,5 @@
  "FolioTone closes and opens again on the new version.": "FolioTone se cierra y se abre de nuevo con la nueva versión.",
  "Download updates automatically": "Descargar actualizaciones automáticamente",
  "Off for builds from Android Studio; you can still check by hand.": "Desactivado en compilaciones de Android Studio; puedes buscar a mano.",
- "Checks GitHub twice a day; you confirm each install.": "Revisa GitHub dos veces al día; tú confirmas cada instalación.",
- "Connection: {0}": "Conexión: {0}"
+ "Checks GitHub twice a day; you confirm each install.": "Revisa GitHub dos veces al día; tú confirmas cada instalación."
 }
