@@ -24,12 +24,11 @@ import java.util.MissingResourceException
  * The part of TextToSpeech that FolioTone uses, so an engine can be reached directly when Android's
  * TextToSpeech refuses it.
  *
- * Why: TextToSpeech only accepts engines whose service declares the DEFAULT category
- * (TtsEngines.isEngineInstalled queries with MATCH_DEFAULT_ONLY). On some phones Samsung's engine
- * doesn't, so TextToSpeech silently falls back to Google's even when Samsung's is chosen or is the
- * phone's default. [Speech.create] uses TextToSpeech whenever it accepts the engine; only for such an
- * engine it binds the engine's service itself ([EngineSpeech]) and switches to TextToSpeech if that
- * fails.
+ * Why: TextToSpeech on current Android asks a system service to connect to the engine. On some
+ * Samsung phones that connection to Samsung's engine fails and TextToSpeech silently moves on to
+ * Google's, so choosing Samsung (or having it as the phone's default) still gave Google's voices.
+ * [Speech.create] keeps TextToSpeech for Google's engine; for any other engine it binds the engine's
+ * service itself ([EngineSpeech]) and switches to TextToSpeech if that fails.
  */
 interface Speech {
     val voices: Set<Voice>?
@@ -46,6 +45,13 @@ interface Speech {
 
     companion object {
         private val intent get() = Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE)
+        /**
+         * Google's engine works through TextToSpeech everywhere, so it always uses it. Other engines are
+         * reached directly first: on some phones TextToSpeech accepts Samsung's engine but the system's
+         * connection to it fails, and TextToSpeech then silently uses Google's instead.
+         */
+        private const val GOOGLE = "com.google.android.tts"
+
         /** Engines whose direct connection failed in this process: use TextToSpeech for them. */
         private val failed = mutableSetOf<String>()
 
@@ -78,14 +84,14 @@ interface Speech {
         fun create(context: Context, engine: String?, onInit: (Int) -> Unit): Speech {
             val target = engine ?: defaultEngine(context)
             val accepted = target != null && platformAccepts(context, target)
-            val service = target?.takeIf { it !in failed && !accepted }
+            val service = target?.takeIf { it !in failed && it != GOOGLE }
                 ?.let { services(context, it, 0).firstOrNull()?.serviceInfo }
             when {
                 target == null -> report("No engine chosen and no phone default: Android TextToSpeech")
-                accepted -> report("$target: Android TextToSpeech accepts it, used normally")
+                target == GOOGLE -> report("$target: Android TextToSpeech")
                 target in failed -> report("$target: direct connection failed earlier (${status ?: "?"}); Android TextToSpeech")
-                service == null -> report("$target: TextToSpeech refuses it and no TTS service was found; Android TextToSpeech")
-                else -> report("$target: TextToSpeech refuses it; connecting directly to ${service.name}" +
+                service == null -> report("$target: no TTS service found (TextToSpeech ${if (accepted) "accepts" else "refuses"} it); Android TextToSpeech")
+                else -> report("$target: connecting directly to ${service.name}" +
                     (service.permission?.let { " (service requires $it)" } ?: "") +
                     if (!service.exported) " (service not exported)" else "")
             }
