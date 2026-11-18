@@ -12,6 +12,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaDescription
 import android.net.Uri
+import android.widget.Toast
 import android.media.MediaMetadata
 import android.media.MediaPlayer
 import android.media.browse.MediaBrowser
@@ -82,6 +83,19 @@ class ReaderService : MediaBrowserService() {
     private var deviceFallback = false
     /** Gapless device-voice playback (RenderAhead); off for the session after it fails once. */
     @Volatile private var renderer: RenderAhead? = null
+    /** Gapless playback is waiting for the voice (reported as buffering, so the time doesn't run on). */
+    private var rendererWaiting = false
+    // Sleep timer: a wall-clock time, or the end of the current section.
+    private var sleepAt = 0L
+    private var sleepAtSectionEnd = false
+    private var sleepSection = -1
+    private var fading = false
+    private val sleepCheck = object : Runnable {
+        override fun run() {
+            if (sleepAt > 0 && System.currentTimeMillis() >= sleepAt) fadeOutAndPause()
+            else if (sleepAt > 0) main.postDelayed(this, 5_000)
+        }
+    }
     private var renderFailed = false
     private var pausedRenderer = false
     /** Pieces gapless playback started most recently (newest last), for Replay. */
@@ -116,6 +130,9 @@ class ReaderService : MediaBrowserService() {
                     val tokens = mediaId?.split(':') ?: return
                     if (tokens.size >= 2 && tokens[0] == "book") open(tokens[1], tokens.getOrNull(2)?.toIntOrNull(), false, true)
                     // Continue: where the book was left, one page earlier if that setting is on.
+                    if (tokens.size >= 3 && tokens[0] == "mark") {
+                        store.bookmarks(tokens[1]).getOrNull(tokens[2].toIntOrNull() ?: -1)?.let { jumpTo(tokens[1], it) }
+                    }
                     if (tokens.size >= 2 && tokens[0] == "resume") {
                         if (book?.id == tokens[1]) { if (!playing) play() } else open(tokens[1], null, true, true)
                     }
@@ -132,6 +149,11 @@ class ReaderService : MediaBrowserService() {
                         "previous page" -> { previous(); if (!playing) play(); return }
                         "replay", "repeat", "repeat that", "say again", "say that again", "again",
                         "repetir", "repite", "repítelo", "otra vez", "de nuevo" -> { replay(); return }
+                        "back", "go back", "rewind", "back 15 seconds", "atrás", "retrocede", "regresa" -> { rewind(15); return }
+                        "bookmark", "bookmark this", "add bookmark", "marcador", "marcar", "guardar marcador" -> { addBookmark(); return }
+                        "sleep timer", "stop in 30 minutes", "temporizador", "dormir" -> { setSleep(30); return }
+                        "sleep at end of chapter", "stop at end of chapter", "al final del capítulo" -> { setSleep(-1); return }
+                        "cancel sleep timer", "cancelar temporizador" -> { setSleep(0); return }
                     }
                     val found = store.books().firstOrNull { query.isNullOrBlank() || it.title.contains(query, true) }
                     if (found != null) open(found.id, null, false, true)
@@ -139,6 +161,10 @@ class ReaderService : MediaBrowserService() {
                 override fun onCustomAction(action: String, extras: Bundle?) {
                     if (action == "section_start") sectionStart()
                     if (action == "replay") replay()
+                    if (action == "back15") rewind(15)
+                    if (action == "bookmark") addBookmark()
+                    // Car button: 30 minutes, then end of chapter, then off.
+                    if (action == "sleep") setSleep(when { sleepAt == 0L && !sleepAtSectionEnd -> 30; sleepAt > 0 -> -1; else -> 0 })
                 }
             })
             isActive = true
@@ -235,6 +261,14 @@ class ReaderService : MediaBrowserService() {
             }
             "PLAY" -> play()
             "REPLAY" -> replay()
+            "BACK15" -> rewind(15)
+            "SLEEP" -> setSleep(intent.getIntExtra("minutes", 0))
+            "BOOKMARK" -> addBookmark()
+            "BOOKMARK_JUMP" -> {
+                val id = intent.getStringExtra("id")
+                val mark = id?.let { store.bookmarks(it).getOrNull(intent.getIntExtra("index", -1)) }
+                if (id != null && mark != null) jumpTo(id, mark)
+            }
             "PAUSE" -> pause()
             "STOP" -> stop()
             "NEXT" -> next()
@@ -314,7 +348,10 @@ class ReaderService : MediaBrowserService() {
         playing = true; speak()
     }
 
+    private fun rate() = store.speechRateFor(book?.id)
+
     private fun pause(error: String? = null) {
+        if (!fading) cancelSleep()
         clearBriefPause()
         val b = book
         val reached = deviceChar
@@ -330,6 +367,104 @@ class ReaderService : MediaBrowserService() {
         state(error)
     }
     private fun stop() { pause(); hasNarrated = false; stopForeground(STOP_FOREGROUND_REMOVE) }
+
+    /**
+     * Back [seconds]: saved audio steps back in the file; gapless playback restarts the piece that began
+     * about that long ago (about 14 characters a second at normal speed); otherwise the current sentence.
+     */
+    private fun rewind(seconds: Int) {
+        val player = cloudPlayer
+        if (player != null && !cloudLoading) {
+            runCatching { player.seekTo((player.currentPosition - seconds * 1_000).coerceAtLeast(0)) }
+            if (!playing) play() else state()
+            return
+        }
+        val history = playedChunks.toList()
+        if (history.isEmpty()) { replay(0); return }
+        var chars = 0
+        var back = 0
+        for (i in history.indices.reversed()) {
+            chars += history[i].text.length
+            back = history.lastIndex - i
+            if (chars >= seconds * 14 * rate()) break
+        }
+        replay(back)
+    }
+
+    private fun sleepLabel(): String = when {
+        sleepAtSectionEnd -> tr("Sleep: end of chapter")
+        sleepAt > 0 -> tr("Sleep: {0} min", ((sleepAt - System.currentTimeMillis()) / 60_000 + 1).coerceAtLeast(1))
+        else -> tr("Sleep timer")
+    }
+
+    /** [minutes] > 0: stop after that long; -1: at the end of the current section; 0: off. */
+    private fun setSleep(minutes: Int) {
+        main.removeCallbacks(sleepCheck)
+        sleepAt = if (minutes > 0) System.currentTimeMillis() + minutes * 60_000L else 0L
+        sleepAtSectionEnd = minutes < 0
+        sleepSection = book?.section ?: -1
+        if (sleepAt > 0) main.postDelayed(sleepCheck, 5_000)
+        Toast.makeText(this, when {
+            minutes > 0 -> tr("Narration stops in {0} minutes", minutes)
+            minutes < 0 -> tr("Narration stops at the end of this chapter")
+            else -> tr("Sleep timer off")
+        }, Toast.LENGTH_SHORT).show()
+        state()
+    }
+
+    private fun cancelSleep() {
+        main.removeCallbacks(sleepCheck)
+        sleepAt = 0L
+        sleepAtSectionEnd = false
+    }
+
+    /** Lowers the volume over about 8 seconds, then pauses and restores it. */
+    private fun fadeOutAndPause() {
+        cancelSleep()
+        if (!playing || fading) { state(); return }
+        fading = true
+        val steps = 16
+        fun level(value: Float) {
+            renderer?.setVolume(value)
+            runCatching { cloudPlayer?.setVolume(value, value) }
+        }
+        for (step in 1..steps) main.postDelayed({
+            if (fading) {
+                level(1f - step / steps.toFloat())
+                if (step == steps) {
+                    pause()
+                    level(1f)
+                    fading = false
+                }
+            }
+        }, step * 500L)
+    }
+
+    /** Saves the current place (the sentence being read, when known) as a bookmark. */
+    private fun addBookmark() {
+        val b = book ?: return
+        val page = sections.getOrNull(b.section)?.pages?.getOrNull(b.page) ?: return
+        val char = (deviceChar ?: 0).coerceIn(0, page.length)
+        val start = sentenceStart(page, char)
+        val snippet = page.substring(start).trim().replace(Regex("\\s+"), " ").take(90)
+        store.addBookmark(b.id, BookStore.Bookmark(b.section, b.page, start, snippet, System.currentTimeMillis()))
+        Toast.makeText(this, tr("Bookmark added"), Toast.LENGTH_SHORT).show()
+        notifyChildrenChanged("bookmarks")
+    }
+
+    /** Opens [bookId] at [mark] and reads from there. */
+    private fun jumpTo(bookId: String, mark: BookStore.Bookmark) {
+        if (book?.id != bookId) open(bookId, mark.section, false, false)
+        val b = book ?: return
+        if (b.id != bookId || mark.section !in sections.indices) return
+        clearBriefPause()
+        haltAudio()
+        sleepSection = mark.section // a jump is not "reaching the end of the chapter"
+        moveTo(PagePosition(mark.section, mark.page.coerceIn(sections[mark.section].pages.indices)))
+        resumeAt = PagePosition(b.section, b.page) to mark.char
+        playing = true
+        speak()
+    }
 
     /**
      * Replay: with gapless device playback, go back [back] pieces and generate them again (voices like
@@ -494,6 +629,12 @@ class ReaderService : MediaBrowserService() {
     }
 
     private fun moveTo(position: PagePosition) {
+        // Sleep timer "end of chapter": stop when narration reaches the next section.
+        if (sleepAtSectionEnd && playing && book?.section == sleepSection && position.section != sleepSection) {
+            book?.let { it.section = position.section; it.page = position.page; saveProgress(it) }
+            fadeOutAndPause()
+            return
+        }
         book?.let {
             it.section = position.section
             it.page = position.page
@@ -534,7 +675,7 @@ class ReaderService : MediaBrowserService() {
         }
         NarrationVoices.choose(tts, locale.language, store.voiceName(locale.language), !networkVoiceFailed)
             ?.let { tts.setVoice(it) }
-        tts.setSpeechRate(store.speechRate)
+        tts.setSpeechRate(rate())
         tts.setPitch(1.0f)
         tts.setAudioAttributes(PlaybackAudioFocus.attributes)
         if (!beginPlayback()) return
@@ -578,6 +719,11 @@ class ReaderService : MediaBrowserService() {
             }
             override fun onFinished() {
                 if (token == generation && playing) finishBook()
+            }
+            override fun onBuffering(waiting: Boolean) {
+                if (token != generation) return
+                rendererWaiting = waiting
+                publishPlayback()
             }
             override fun onFailed(message: String) {
                 if (token != generation) return
@@ -650,6 +796,7 @@ class ReaderService : MediaBrowserService() {
      * Abbreviations (Mr., Dr., Sra., initials) do not end a sentence.
      */
     private fun renderSentences(page: String, from: Int): List<Sentence> {
+        val pauseScale = store.pauseScale
         val sentences = mutableListOf<Sentence>()
         var cursor = from
         for (end in SENTENCE_END.findAll(page, from)) {
@@ -662,14 +809,14 @@ class ReaderService : MediaBrowserService() {
                 end.value.count { it == '\n' } >= 1 -> PARAGRAPH_PAUSE_MS
                 end.value.contains('…') || end.value.contains("...") -> SENTENCE_PAUSE_MS
                 else -> SENTENCE_PAUSE_MS
-            }
+            }.let { (it * pauseScale).toInt() }
             if (page.substring(cursor, stop).isNotBlank()) sentences += Sentence(cursor, page.substring(cursor, stop), pause, true)
             cursor = stop
         }
         val rest = page.substring(cursor)
         if (rest.isNotBlank()) {
             val complete = rest.trimEnd().lastOrNull()?.let { it in ".!?…»”\"'’)" } ?: true
-            sentences += Sentence(cursor, rest, SENTENCE_PAUSE_MS, complete)
+            sentences += Sentence(cursor, rest, (SENTENCE_PAUSE_MS * pauseScale).toInt(), complete)
         }
         return sentences.flatMap { splitLong(it) }
     }
@@ -780,6 +927,7 @@ class ReaderService : MediaBrowserService() {
         deviceFallback = false
         renderer?.stop()
         renderer = null
+        rendererWaiting = false
         pausedRenderer = false
         playedChunks.clear()
         if (::tts.isInitialized) tts.stop()
@@ -802,7 +950,7 @@ class ReaderService : MediaBrowserService() {
             return
         }
         if (!beginPlayback()) return
-        val request = cloudRequest(book, PagePosition(book.section, book.page), key, voiceId, store.speechRate)
+        val request = cloudRequest(book, PagePosition(book.section, book.page), key, voiceId, rate())
         val queued = if (prefetchedRequest == request) prefetchedCloud else null
         if (queued == null) prefetchedCloud?.cancel(true)
         prefetchedCloud = null
@@ -842,7 +990,7 @@ class ReaderService : MediaBrowserService() {
         cloudLoading = true
         state()
         // Audio is generated at normal speed; the narration speed is applied while playing.
-        playCloudFile(file, token, null, store.speechRate)
+        playCloudFile(file, token, null, rate())
     }
 
     private fun generateCloud(request: CloudRequest): File = ElevenLabs(this).audio(
@@ -923,10 +1071,10 @@ class ReaderService : MediaBrowserService() {
 
     private fun currentTimeline(): SectionTimeline {
         val section = book?.section ?: -1
-        if (section != timelineSection || timelineRate != store.speechRate) {
-            timeline = SectionTimeline(sections.getOrNull(section)?.pages.orEmpty(), store.speechRate)
+        if (section != timelineSection || timelineRate != rate()) {
+            timeline = SectionTimeline(sections.getOrNull(section)?.pages.orEmpty(), rate())
             timelineSection = section
-            timelineRate = store.speechRate
+            timelineRate = rate()
         }
         return timeline
     }
@@ -1001,9 +1149,14 @@ class ReaderService : MediaBrowserService() {
                 PlaybackState.ACTION_STOP or PlaybackState.ACTION_SKIP_TO_NEXT or
                 PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SEEK_TO or
                 PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH)
-            .setState(if (cloudLoading) PlaybackState.STATE_BUFFERING else if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                mediaPosition(), if (playing && !cloudLoading) 1f else 0f, SystemClock.elapsedRealtime())
+            .setState(if (cloudLoading || (playing && rendererWaiting)) PlaybackState.STATE_BUFFERING
+                else if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                // Gapless playback reports its place per piece, so the time isn't run on (and jumped back).
+                mediaPosition(), if (playing && !cloudLoading && renderer == null) 1f else 0f, SystemClock.elapsedRealtime())
+        builder.addCustomAction("back15", tr("Back 15 s"), R.drawable.ic_car_back15)
         if (store.replayUseful(this)) builder.addCustomAction("replay", tr("Replay"), R.drawable.ic_car_replay)
+        builder.addCustomAction("bookmark", tr("Bookmark"), R.drawable.ic_car_bookmark)
+        builder.addCustomAction("sleep", sleepLabel(), R.drawable.ic_car_timer)
         builder.addCustomAction("section_start", tr("Start section"), R.drawable.ic_car_section_start)
         if (error != null) builder.setErrorMessage(error)
         session.setPlaybackState(builder.build())
@@ -1031,6 +1184,7 @@ class ReaderService : MediaBrowserService() {
         sendBroadcast(Intent("com.linguareader.STATE").setPackage(packageName)
             .putExtra("playing", playing).putExtra("error", error)
             .putExtra("finished", sectionFinished)
+            .putExtra("sleepAt", sleepAt).putExtra("sleepAtSectionEnd", sleepAtSectionEnd)
             .putExtra("id", b?.id).putExtra("section", b?.section ?: 0).putExtra("page", b?.page ?: 0))
     }
 
@@ -1152,7 +1306,16 @@ class ReaderService : MediaBrowserService() {
                     parentId == "root" -> mutableListOf(
                         tab("continue", tr("Continue"), "ic_car_continue", STYLE_LIST),
                         tab("library", tr("Library"), "ic_car_library", STYLE_GRID),
-                        tab("chapters", tr("Chapters"), "ic_car_chapters", STYLE_LIST))
+                        tab("chapters", tr("Chapters"), "ic_car_chapters", STYLE_LIST),
+                        tab("bookmarks", tr("Bookmarks"), "ic_car_bookmark", STYLE_LIST))
+                    parentId == "bookmarks" -> (book ?: store.recentBooks(1).firstOrNull())?.let { b ->
+                        store.bookmarks(b.id).mapIndexed { index, mark ->
+                            MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId("mark:${b.id}:$index")
+                                .setTitle(mark.text.ifBlank { tr("Bookmark") })
+                                .setSubtitle(tr("Section {0} · page {1}", mark.section + 1, mark.page + 1))
+                                .setIconUri(resourceUri("ic_car_bookmark")).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE)
+                        }.toMutableList()
+                    } ?: mutableListOf()
                     parentId == "recent" -> store.recentBooks(1).map { resumeItem(it) }.toMutableList()
                     parentId == "continue" -> store.recentBooks(8).map { resumeItem(it) }.toMutableList()
                         .ifEmpty { store.books().take(8).map { resumeItem(it) }.toMutableList() }

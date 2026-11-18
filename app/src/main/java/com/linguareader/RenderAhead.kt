@@ -49,6 +49,8 @@ class RenderAhead(
         fun onChunkStarted(chunk: Chunk)
         fun onFinished()
         fun onFailed(message: String)
+        /** True while playback waits for the voice to finish the next piece. */
+        fun onBuffering(waiting: Boolean) {}
     }
 
     companion object {
@@ -79,6 +81,8 @@ class RenderAhead(
     @Volatile private var finishedRendering = false
     /** Uptime when the player last ran out of audio while more was expected (0 while it has audio). */
     private var starvedSince = 0L
+    private var waiting = false
+    @Volatile private var volume = 1f
 
     private val renderThread = Thread({ render() }, "FolioTone-render")
     private val playThread = Thread({ play() }, "FolioTone-play")
@@ -98,6 +102,7 @@ class RenderAhead(
             // working on the next piece for too long, fall back instead of staying silent.
             val now = android.os.SystemClock.uptimeMillis()
             val dry = !paused && !finishedRendering && ready.isEmpty() && (head == null || head >= framesWritten)
+            if (dry != waiting) { waiting = dry; events.onBuffering(dry) }
             if (!dry) starvedSince = 0L
             else if (starvedSince == 0L) starvedSince = now
             else if (now - starvedSince > STARVED_MS) {
@@ -126,6 +131,12 @@ class RenderAhead(
     fun resume() {
         paused = false
         runCatching { track?.play() }
+    }
+
+    /** Output volume, 0..1 (the sleep timer fades out with it). */
+    fun setVolume(value: Float) {
+        volume = value.coerceIn(0f, 1f)
+        runCatching { track?.setVolume(volume) }
     }
 
     fun stop() {
@@ -283,6 +294,7 @@ class RenderAhead(
                 .setBufferSizeInBytes(maxOf(minimum, wav.rate * wav.channels * 2 / 2))
                 .build()
                 .also {
+                    it.setVolume(volume)
                     if (!paused) it.play()
                     track = it
                 }
