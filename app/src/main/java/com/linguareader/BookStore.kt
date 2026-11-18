@@ -132,9 +132,47 @@ class BookStore private constructor(private val context: Context) {
             .toInt().coerceIn(0, 100)
     }
 
+    /** Narration speed of the open book (each book keeps its own), or the default when none is open. */
     var speechRate: Float
-        get() = prefs.getFloat("speech_rate", 0.94f).coerceIn(0.75f, 1.2f)
-        set(value) { prefs.edit().putFloat("speech_rate", value.coerceIn(0.75f, 1.2f)).apply() }
+        get() = speechRateFor(lastOpenedId)
+        set(value) {
+            val id = lastOpenedId
+            prefs.edit().putFloat(if (id != null) "speech_rate_$id" else "speech_rate", value.coerceIn(0.75f, 1.2f)).apply()
+        }
+
+    /** [bookId]'s own speed if one was set, else the default. */
+    fun speechRateFor(bookId: String?): Float {
+        val own = bookId?.let { "speech_rate_$it" }?.takeIf { prefs.contains(it) }
+        return prefs.getFloat(own ?: "speech_rate", 0.94f).coerceIn(0.75f, 1.2f)
+    }
+
+    /** Gapless playback: multiplier for the pauses after sentences and paragraphs (0 = none). */
+    var pauseScale: Float
+        get() = prefs.getFloat("pause_scale", 1f).coerceIn(0f, 2f)
+        set(value) { prefs.edit().putFloat("pause_scale", value.coerceIn(0f, 2f)).apply() }
+
+    /** A saved place: page plus the character the narration was at, and the words there. */
+    data class Bookmark(val section: Int, val page: Int, val char: Int, val text: String, val created: Long)
+
+    fun bookmarks(bookId: String): List<Bookmark> = runCatching {
+        val array = JSONArray(prefs.getString("bookmarks_$bookId", "[]"))
+        (0 until array.length()).map { array.getJSONObject(it) }.map {
+            Bookmark(it.optInt("section"), it.optInt("page"), it.optInt("char"), it.optString("text"), it.optLong("created"))
+        }
+    }.getOrDefault(emptyList())
+
+    private fun saveBookmarks(bookId: String, marks: List<Bookmark>) {
+        val array = JSONArray()
+        marks.forEach { array.put(JSONObject().put("section", it.section).put("page", it.page).put("char", it.char)
+            .put("text", it.text).put("created", it.created)) }
+        prefs.edit().putString("bookmarks_$bookId", array.toString()).apply()
+    }
+
+    fun addBookmark(bookId: String, mark: Bookmark) = saveBookmarks(bookId,
+        (bookmarks(bookId).filterNot { it.section == mark.section && it.page == mark.page && it.char == mark.char } + mark)
+            .sortedWith(compareBy({ it.section }, { it.page }, { it.char })))
+
+    fun removeBookmark(bookId: String, mark: Bookmark) = saveBookmarks(bookId, bookmarks(bookId) - mark)
 
     var speechEngine: String?
         get() = prefs.getString("speech_engine", null)

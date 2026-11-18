@@ -71,6 +71,9 @@ class MainActivity : Activity() {
     private var sessionSection: Int? = null
     private var sessionPage: Int? = null
     private var playing = false
+    /** Sleep timer as reported by the service: wall-clock stop time, or the end of the chapter. */
+    private var sleepAt = 0L
+    private var sleepAtSectionEnd = false
     /** Book the narration service has loaded, from its last state broadcast. */
     private var serviceBookId: String? = null
     /** Positions shown by the current home screen, to redraw it when narration moves on. */
@@ -106,6 +109,8 @@ class MainActivity : Activity() {
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             playing = intent?.getBooleanExtra("playing", false) ?: false
+            sleepAt = intent?.getLongExtra("sleepAt", 0L) ?: 0L
+            sleepAtSectionEnd = intent?.getBooleanExtra("sleepAtSectionEnd", false) ?: false
             serviceBookId = intent?.getStringExtra("id")
             playbackButton?.text = playbackLabel()
             if (intent?.getStringExtra("id") == selectedId) {
@@ -1295,6 +1300,9 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, -2, 1f))
         speedRow.addView(speedValue, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(4) })
         addSettingRow(general, speedRow)
+        store.lastOpenedId?.let { id -> store.books().firstOrNull { it.id == id } }?.let { current ->
+            settingNote(general, tr("Speed is saved for “{0}”. Each book keeps its own.", current.title))
+        }
 
         val narration = settingsGroup(tr("Narration"))
         settingRow(narration, tr("Source"), when (store.narrationSource) {
@@ -1365,6 +1373,18 @@ class MainActivity : Activity() {
             store.renderAhead) {
             store.renderAhead = it
             command("VOICE_CHANGED")
+            showSettings()
+        }
+        if (store.renderAhead) {
+            val scales = listOf(0f to tr("None"), 0.5f to tr("Short"), 1f to tr("Normal"), 1.6f to tr("Long"))
+            val current = scales.minByOrNull { kotlin.math.abs(it.first - store.pauseScale) } ?: scales[2]
+            settingRow(card, tr("Pauses between sentences"), current.second) {
+                choiceSheet(tr("Pauses between sentences"), scales.map { MenuChoice(it.second) }, scales.indexOf(current)) { index ->
+                    store.pauseScale = scales[index].first
+                    command("VOICE_CHANGED")
+                    showSettings()
+                }
+            }
         }
     }
 
@@ -2113,8 +2133,15 @@ class MainActivity : Activity() {
         val listen = compact(button(playbackLabel()) { command(if (playing) "PAUSE" else "PLAY") }, 44)
         playbackButton = listen
         content.addView(rowOf(compact(secondary(tr("◀  Back")) { command("PREVIOUS") }, 44),
+            compact(secondary(tr("⟲ 15 s")) { command("BACK15") }, 44).apply { contentDescription = tr("Back 15 seconds") },
             listen,
             compact(secondary(tr("Next  ▶")) { command("NEXT") }, 44)))
+        if (sleepAt > 0 || sleepAtSectionEnd) {
+            gap(6)
+            val until = if (sleepAtSectionEnd) tr("at the end of this chapter")
+                else java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(sleepAt))
+            content.addView(compact(secondary(tr("🌙 Narration stops {0} · change", until)) { chooseSleep() }, 34))
+        }
         gap(6)
         val contents = compact(secondary(tr("Contents")) { showContents(book, parsed, sectionIndex, pageIndex) }, 38)
         val options = compact(secondary(tr("Voice & options")) { readerOptions(book) }, 38)
@@ -2176,7 +2203,7 @@ class MainActivity : Activity() {
         if (key == null) { status.text = tr("Connect ElevenLabs to save this book"); return }
         val voice = store.elevenVoiceId(NarrationVoices.locale(book.language).language)
         if (voice == null) { status.text = tr("Choose an ElevenLabs voice for this book"); return }
-        val rate = store.speechRate
+        val rate = store.speechRateFor(book.id)
         worker.execute {
             val count = runCatching {
                 ElevenLabs(this).let { eleven ->
@@ -2219,7 +2246,7 @@ class MainActivity : Activity() {
             toast(tr("Connect ElevenLabs and choose a voice for this book first."))
             return
         }
-        val rate = store.speechRate
+        val rate = store.speechRateFor(book.id)
         offerDownloads(book, parsed, "elevenlabs", null,
             cost = { _, chars -> tr("about {0} ElevenLabs credits", "%,d".format(chars)) },
             saved = { pages ->
@@ -2394,12 +2421,50 @@ class MainActivity : Activity() {
                 }
             }
         )
+        actions += MenuChoice(tr("Sleep timer"), when {
+            sleepAtSectionEnd -> tr("Stops at the end of this chapter")
+            sleepAt > 0 -> tr("Stops at {0}", java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(sleepAt)))
+            else -> tr("Off")
+        }) to { chooseSleep() }
+        actions += MenuChoice(tr("Add bookmark"), tr("Saves the sentence being read")) to { command("BOOKMARK") }
+        val marks = store.bookmarks(book.id)
+        if (marks.isNotEmpty()) actions += MenuChoice(tr("Bookmarks"), tr("{0} saved", marks.size)) to { showBookmarks(book) }
         if (cloud) actions += MenuChoice(tr("Regenerate this page"),
             tr("Create this page's audio again if it sounds wrong or will not play")) to { regenerateCurrentPage(book) }
         actions += MenuChoice(tr("Listening settings"), tr("Provider, speed and resume")) to {
             settingsLanguage = book.language.ifBlank { "en" }; showSettings()
         }
         choiceSheet(tr("Listening options"), actions.map { it.first }) { actions[it].second() }
+    }
+
+    private fun chooseSleep() {
+        val options = listOf(15, 30, 45, 60, 90)
+        val choices = listOf(MenuChoice(tr("Off"))) + options.map { MenuChoice(tr("{0} minutes", it)) } +
+            MenuChoice(tr("End of chapter"), tr("Stops when this chapter ends"))
+        val current = when {
+            sleepAtSectionEnd -> choices.lastIndex
+            sleepAt > 0 -> -1
+            else -> 0
+        }
+        choiceSheet(tr("Sleep timer"), choices, current) { index ->
+            command("SLEEP", "minutes" to when (index) { 0 -> 0; choices.lastIndex -> -1; else -> options[index - 1] })
+        }
+    }
+
+    private fun showBookmarks(book: Book) {
+        val marks = store.bookmarks(book.id)
+        if (marks.isEmpty()) { toast(tr("No bookmarks yet")); return }
+        val titles = cachedBook?.takeIf { cachedBookId == book.id }?.sections
+        choiceSheet(tr("Bookmarks"), marks.map { mark ->
+            val chapter = titles?.getOrNull(mark.section)?.title ?: tr("Section {0}", mark.section + 1)
+            MenuChoice(mark.text.ifBlank { tr("Bookmark") }, tr("{0} · page {1}", chapter, mark.page + 1))
+        }) { index ->
+            val mark = marks[index]
+            choiceSheet(mark.text.take(60), listOf(MenuChoice(tr("Listen from here")), MenuChoice(tr("Delete bookmark")))) { action ->
+                if (action == 0) command("BOOKMARK_JUMP", "id" to book.id, "index" to index)
+                else { store.removeBookmark(book.id, mark); toast(tr("Bookmark deleted")) }
+            }
+        }
     }
 
     private fun regenerateCurrentPage(book: Book) {
