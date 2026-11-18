@@ -2127,7 +2127,8 @@ class MainActivity : Activity() {
             listen,
             compact(secondary(tr("Next  ▶")) { command("NEXT") }, 44)))
         gap(6)
-        content.addView(rowOf(compact(secondary(tr("Contents")) { showContents(book, parsed, sectionIndex, pageIndex) }, 38),
+        content.addView(rowOf(compact(secondary(tr("↺ Replay")) { command("REPLAY") }, 38),
+            compact(secondary(tr("Contents")) { showContents(book, parsed, sectionIndex, pageIndex) }, 38),
             compact(secondary(tr("Voice & options")) { readerOptions(book) }, 38)))
         if (store.narrationSource == "elevenlabs" || store.narrationSource == "server") showOfflineAudio(book, parsed)
         gap(16)

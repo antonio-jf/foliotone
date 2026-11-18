@@ -83,6 +83,8 @@ class ReaderService : MediaBrowserService() {
     @Volatile private var renderer: RenderAhead? = null
     private var renderFailed = false
     private var pausedRenderer = false
+    /** Pieces gapless playback started most recently (newest last), for Replay. */
+    private val playedChunks = ArrayDeque<RenderAhead.Chunk>()
     private val progressTick = object : Runnable {
         override fun run() {
             if (!playing) return
@@ -123,12 +125,15 @@ class ReaderService : MediaBrowserService() {
                         "previous section" -> { changeSection(-1); if (!playing) play(); return }
                         "next page" -> { next(); if (!playing) play(); return }
                         "previous page" -> { previous(); if (!playing) play(); return }
+                        "replay", "repeat", "repeat that", "say again", "say that again", "again",
+                        "repetir", "repite", "repítelo", "otra vez", "de nuevo" -> { replay(); return }
                     }
                     val found = store.books().firstOrNull { query.isNullOrBlank() || it.title.contains(query, true) }
                     if (found != null) open(found.id, null, false, true)
                 }
                 override fun onCustomAction(action: String, extras: Bundle?) {
                     if (action == "section_start") sectionStart()
+                    if (action == "replay") replay()
                 }
             })
             isActive = true
@@ -224,6 +229,7 @@ class ReaderService : MediaBrowserService() {
                 if (book?.id == id) state() else open(id, null, false, false)
             }
             "PLAY" -> play()
+            "REPLAY" -> replay()
             "PAUSE" -> pause()
             "STOP" -> stop()
             "NEXT" -> next()
@@ -319,6 +325,42 @@ class ReaderService : MediaBrowserService() {
         state(error)
     }
     private fun stop() { pause(); hasNarrated = false; stopForeground(STOP_FOREGROUND_REMOVE) }
+
+    /**
+     * Replay: with gapless device playback, go back [back] pieces and generate them again (voices like
+     * SherpaTTS/Piper vary a little each time, so a garbled sentence usually comes out right). Otherwise
+     * restart from the current sentence (device voice) or step back 10 s (saved audio).
+     */
+    private fun replay(back: Int = 2) {
+        val b = book ?: return
+        val history = playedChunks.toList()
+        val target = history.getOrNull(history.size - 1 - back) ?: history.firstOrNull()
+        val player = cloudPlayer
+        when {
+            target != null -> {
+                val position = PagePosition(target.section, target.page)
+                clearBriefPause()
+                haltAudio()
+                if (position != PagePosition(b.section, b.page)) moveTo(position)
+                resumeAt = position to target.start
+            }
+            player != null && !cloudLoading -> {
+                runCatching { player.seekTo((player.currentPosition - 10_000).coerceAtLeast(0)) }
+                if (!playing) play() else state()
+                return
+            }
+            else -> {
+                val page = sections.getOrNull(b.section)?.pages?.getOrNull(b.page)
+                val reached = deviceChar
+                val saved = resumeAt // set by Pause: the piece that was playing
+                clearBriefPause()
+                resumeAt = if (page != null && reached != null) PagePosition(b.section, b.page) to sentenceStart(page, reached)
+                    else saved
+            }
+        }
+        playing = true
+        speak()
+    }
 
     /** Another app talks for a moment: hold our place and keep the audio focus. */
     private fun pauseBriefly() {
@@ -519,6 +561,10 @@ class ReaderService : MediaBrowserService() {
                 val position = PagePosition(chunk.section, chunk.page)
                 val pageChanged = position != PagePosition(b.section, b.page)
                 if (pageChanged) moveTo(position)
+                if (chunk.text.isNotEmpty()) {
+                    playedChunks.addLast(chunk)
+                    while (playedChunks.size > 12) playedChunks.removeFirst()
+                }
                 val length = sections.getOrNull(chunk.section)?.pages?.getOrNull(chunk.page)?.length ?: 1
                 pageStartedAt = SystemClock.elapsedRealtime()
                 deviceChar = chunk.start
@@ -700,6 +746,7 @@ class ReaderService : MediaBrowserService() {
         renderer?.stop()
         renderer = null
         pausedRenderer = false
+        playedChunks.clear()
         if (::tts.isInitialized) tts.stop()
     }
 
@@ -921,6 +968,7 @@ class ReaderService : MediaBrowserService() {
                 PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH)
             .setState(if (cloudLoading) PlaybackState.STATE_BUFFERING else if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
                 mediaPosition(), if (playing && !cloudLoading) 1f else 0f, SystemClock.elapsedRealtime())
+            .addCustomAction("replay", tr("Replay"), R.drawable.ic_foliotone_monochrome)
             .addCustomAction("section_start", tr("Start section"), R.drawable.ic_foliotone_monochrome)
         if (error != null) builder.setErrorMessage(error)
         session.setPlaybackState(builder.build())
@@ -971,6 +1019,7 @@ class ReaderService : MediaBrowserService() {
             .addAction(action("PREVIOUS", tr("Back"), R.drawable.ic_foliotone_monochrome))
             .addAction(action(if (playing) "PAUSE" else "PLAY", if (playing) tr("Pause") else tr("Play"), R.drawable.ic_foliotone_monochrome))
             .addAction(action("NEXT", tr("Next"), R.drawable.ic_foliotone_monochrome))
+            .addAction(action("REPLAY", tr("Replay"), R.drawable.ic_foliotone_monochrome))
             .setStyle(Notification.MediaStyle().setMediaSession(session.sessionToken).setShowActionsInCompactView(0, 1, 2))
             .build()
     }
