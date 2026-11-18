@@ -48,6 +48,9 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
     private val importRequest = 10
     private val folderRequest = 11
+    private val backupRequest = 12
+    private val restoreRequest = 13
+    private var backupWithBooks = true
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private lateinit var store: BookStore
@@ -99,7 +102,6 @@ class MainActivity : Activity() {
     private var browsingGutenberg = false
     private var browsingRatings = false
     private var ratingsFilter = 0
-    private var libraryFilter = 0
     private var gutenbergQuery = ""
     private val gutenbergResults = mutableListOf<GutenbergBook>()
     private var gutenbergNext: String? = null
@@ -411,15 +413,66 @@ class MainActivity : Activity() {
     }
 
     private fun bookStatusOptions(book: Book) {
+        val narration = NarrationLibrary.bytesFor(this, book.id)
         choiceSheet(book.title, listOf(
             MenuChoice(if (store.isRead(book.id)) tr("Mark as unread") else tr("Mark as read")),
-            MenuChoice(tr("Rate book")), MenuChoice(tr("Open book"))
+            MenuChoice(tr("Rate book")), MenuChoice(tr("Open book")),
+            MenuChoice(tr("Storage"), tr("Book {0} · narration {1}", megabytes(store.file(book).length()), megabytes(narration)))
         )) { index ->
             when (index) {
                 0 -> { store.setRead(book.id, !store.isRead(book.id)); refreshCurrentScreen() }
                 1 -> rateBook(book)
                 2 -> openBook(book)
+                3 -> bookStorage(book, narration)
             }
+        }
+    }
+
+    private fun megabytes(bytes: Long) = if (bytes <= 0) tr("none") else "%.1f MB".format(bytes / 1_048_576.0)
+
+    private fun bookStorage(book: Book, narration: Long) {
+        val choices = mutableListOf<Pair<MenuChoice, () -> Unit>>()
+        if (narration > 0) choices += MenuChoice(tr("Delete this book's narration"),
+            tr("Frees {0}. The book and your progress stay.", megabytes(narration))) to {
+            confirm(tr("Delete the saved narration of “{0}”?", book.title), tr("Delete narration")) {
+                if (OfflineDownloadService.activeBookId == book.id) command("PAUSE")
+                worker.execute {
+                    NarrationLibrary.deleteFor(this, book.id)
+                    main.post { toast(tr("Narration deleted")); refreshCurrentScreen() }
+                }
+            }
+        }
+        choices += MenuChoice(tr("Remove book from library"),
+            tr("Deletes the book, its narration, bookmarks and progress from this device")) to {
+            confirm(tr("Remove “{0}” from this device?", book.title), tr("Remove book")) {
+                if (serviceBookId == book.id) command("STOP")
+                worker.execute {
+                    NarrationLibrary.deleteFor(this, book.id)
+                    store.removeBook(book.id)
+                    main.post {
+                        if (selectedId == book.id) selectedId = null
+                        toast(tr("Book removed")); showHome()
+                    }
+                }
+            }
+        }
+        choiceSheet(tr("Storage · {0}", book.title), choices.map { it.first }) { choices[it].second() }
+    }
+
+    /** A two-option sheet: [action] runs only after the user picks [yes]. */
+    private fun confirm(question: String, yes: String, action: () -> Unit) {
+        choiceSheet(question, listOf(MenuChoice(yes), MenuChoice(tr("Cancel")))) { if (it == 0) action() }
+    }
+
+    private fun startBackup() {
+        choiceSheet(tr("Back up library"), listOf(
+            MenuChoice(tr("Books, progress and settings"), tr("Everything needed to restore on a new phone")),
+            MenuChoice(tr("Progress and settings only"), tr("Small file; books must be added again"))
+        )) { index ->
+            backupWithBooks = index == 0
+            val name = "FolioTone-backup-" + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date()) + ".zip"
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/zip").putExtra(Intent.EXTRA_TITLE, name), backupRequest)
         }
     }
 
@@ -722,16 +775,22 @@ class MainActivity : Activity() {
             gap(5)
             addText("${books.size} ${if (books.size == 1) "book" else "books"}", 13f, muted)
             gap(12)
-            val filters = listOf(tr("All books"), tr("Unread"), tr("Read"))
+            val filters = listOf(tr("All books"), tr("In progress"), tr("Not started"), tr("Read"), tr("Narration downloaded"))
+            val sorts = listOf(tr("Recently read"), tr("Title"), tr("Author"), tr("Progress"))
             val libraryControls = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            libraryControls.addView(secondary("${filters[libraryFilter]}  ▾") {
-                choiceSheet(tr("Library view"), filters.map { MenuChoice(it) }, libraryFilter) { index ->
-                    libraryFilter = index; showHome()
+            libraryControls.addView(compact(secondary("${filters[store.libraryFilterChoice]}  ▾") {
+                choiceSheet(tr("Show"), filters.map { MenuChoice(it) }, store.libraryFilterChoice) { index ->
+                    store.libraryFilterChoice = index; showHome()
                 }
-            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            }, 42), LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
+            libraryControls.addView(compact(secondary("⇅ ${sorts[store.librarySort]}") {
+                choiceSheet(tr("Sort by"), sorts.map { MenuChoice(it) }, store.librarySort) { index ->
+                    store.librarySort = index; showHome()
+                }
+            }, 42), LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) })
             fun viewToggle(label: String, grid: Boolean): TextView {
                 val selected = store.libraryGrid == grid
                 val action = { setLibraryGrid(grid) }
@@ -745,8 +804,17 @@ class MainActivity : Activity() {
             libraryControls.addView(viewToggle(tr("Grid"), true), LinearLayout.LayoutParams(dp(64), -2))
             content.addView(libraryControls)
             gap(10)
-            val visible = books.filter { libraryFilter == 0 || store.isRead(it.id) == (libraryFilter == 2) }
-            if (visible.isEmpty()) addText(if (libraryFilter == 2) tr("No read books yet.") else tr("No unread books."), 14f, muted)
+            val visible = sortedLibrary(books.filter { book ->
+                val read = store.isRead(book.id)
+                when (store.libraryFilterChoice) {
+                    1 -> !read && (book.section > 0 || book.page > 0)
+                    2 -> !read && book.section == 0 && book.page == 0
+                    3 -> read
+                    4 -> runCatching { NarrationLibrary.badge(this, book) }.getOrNull() != null
+                    else -> true
+                }
+            })
+            if (visible.isEmpty()) addText(tr("No books match “{0}”.", filters[store.libraryFilterChoice]), 14f, muted)
             if (store.libraryGrid) showLibraryGrid(visible)
             else visible.forEach { book ->
                 val bookRow = LinearLayout(this).apply {
@@ -784,6 +852,16 @@ class MainActivity : Activity() {
             if (store.folderUri == null) startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), folderRequest)
             else scanFolder()
         })
+    }
+
+    private fun sortedLibrary(books: List<Book>): List<Book> = when (store.librarySort) {
+        1 -> books.sortedBy { it.title.lowercase() }
+        2 -> books.sortedWith(compareBy({ it.author.ifBlank { "\uFFFF" }.lowercase() }, { it.title.lowercase() }))
+        3 -> books.sortedByDescending { progress(it) }
+        else -> {
+            val order = store.recentBooks(Int.MAX_VALUE).mapIndexed { index, book -> book.id to index }.toMap()
+            books.sortedBy { order[it.id] ?: Int.MAX_VALUE }
+        }
     }
 
     /** "🎧 Server narration downloaded" (accent) or a partial/other-voice note (muted); null if none saved. */
@@ -1367,6 +1445,13 @@ class MainActivity : Activity() {
             if (AppUpdates.isDevelopmentBuild(this)) tr("Off for builds from Android Studio; you can still check by hand.")
             else tr("Checks GitHub twice a day; you confirm each install."),
             AppUpdates.isAutomatic(this)) { AppUpdates.setAutomatic(this, it) }
+
+        val backup = settingsGroup(tr("Backup"))
+        settingRow(backup, tr("Back up library"), tr("Books, reading progress, bookmarks and settings to a file")) { startBackup() }
+        settingRow(backup, tr("Restore from a backup"), tr("API keys and downloaded narration are not included")) {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*").putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream")), restoreRequest)
+        }
 
         val storage = settingsGroup(tr("Storage"))
         val storageValue = settingRow(storage, tr("Delete all downloaded narration"), tr("Checking saved audio…"),
@@ -2761,6 +2846,31 @@ class MainActivity : Activity() {
             folderRequest -> {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 store.folderUri = uri.toString(); scanFolder()
+            }
+            backupRequest -> {
+                toast(tr("Saving backup…"))
+                val withBooks = backupWithBooks
+                worker.execute {
+                    val result = runCatching { Backup.export(this, uri, withBooks) }
+                    main.post {
+                        result.onSuccess { toast(tr("Backup saved: {0} books", it.books)) }
+                            .onFailure { toast(tr("Backup failed: {0}", it.message ?: "")) }
+                    }
+                }
+            }
+            restoreRequest -> confirm(tr("Restore this backup?"), tr("Restore")) {
+                toast(tr("Restoring…"))
+                if (playing) command("PAUSE")
+                worker.execute {
+                    val result = runCatching { Backup.restore(this, uri) }
+                    main.post {
+                        result.onSuccess {
+                            toast(tr("Restored {0} books and your settings", it.books))
+                            I18n.apply(this, store.appLanguage)
+                            recreate()
+                        }.onFailure { toast(tr("Restore failed: {0}", it.message ?: "")) }
+                    }
+                }
             }
         }
     }
