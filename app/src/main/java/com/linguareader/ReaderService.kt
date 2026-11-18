@@ -621,7 +621,38 @@ class ReaderService : MediaBrowserService() {
             val complete = rest.trimEnd().lastOrNull()?.let { it in ".!?…»”\"'’)" } ?: true
             sentences += Sentence(cursor, rest, SENTENCE_PAUSE_MS, complete)
         }
-        return sentences
+        return sentences.flatMap { splitLong(it) }
+    }
+
+    /**
+     * Splits a long sentence at commas, semicolons, colons and dashes into parts of about
+     * [CLAUSE_TARGET] characters (at spaces if a clause is still too long). Voices like SherpaTTS/Piper
+     * slow down more than proportionally on long input: on a test phone 20 characters rendered in 0.7 s,
+     * but a 219-character sentence took over 16 s, longer than it takes to hear.
+     */
+    private fun splitLong(sentence: Sentence): List<Sentence> {
+        val text = sentence.text
+        if (text.length <= CLAUSE_LIMIT) return listOf(sentence)
+        val cuts = CLAUSE_END.findAll(text).map { it.range.last + 1 }.toMutableList()
+        val parts = mutableListOf<Pair<Int, Int>>()
+        var partStart = 0
+        while (text.length - partStart > CLAUSE_LIMIT) {
+            val limit = partStart + CLAUSE_TARGET
+            var cut = cuts.lastOrNull { it in (partStart + 20)..limit }
+                ?: cuts.firstOrNull { it in (limit + 1)..(partStart + CLAUSE_LIMIT) }
+            if (cut == null) {
+                // No clause boundary nearby: cut at the last space before the target.
+                cut = text.lastIndexOf(' ', limit).takeIf { it > partStart + 20 }?.plus(1) ?: break
+            }
+            parts += partStart to cut
+            partStart = cut
+        }
+        parts += partStart to text.length
+        return parts.mapIndexed { index, (from, to) ->
+            val last = index == parts.lastIndex
+            Sentence(sentence.start + from, text.substring(from, to),
+                if (last) sentence.pauseMs else 0, if (last) sentence.complete else true)
+        }.filter { it.text.isNotBlank() }
     }
 
     private fun beginPlayback(): Boolean {
@@ -1015,6 +1046,13 @@ class ReaderService : MediaBrowserService() {
 /** Silence FolioTone adds after a sentence / paragraph in gapless playback. Off for now. */
 private const val SENTENCE_PAUSE_MS = 0
 private const val PARAGRAPH_PAUSE_MS = 0
+
+/** Sentences longer than this are split into clauses of about CLAUSE_TARGET characters (splitLong). */
+private const val CLAUSE_LIMIT = 160
+private const val CLAUSE_TARGET = 120
+
+/** Clause boundary inside a sentence: comma, semicolon, colon or dash, then space. */
+private val CLAUSE_END = Regex("[,;:]\\s+|\\s[—–]\\s+|—")
 
 /** End of a sentence (terminal punctuation, closing quotes, then space) or a paragraph break. */
 private val SENTENCE_END = Regex("[.!?…]+[»”\"'’)\\]]*\\s+|\\n\\s*\\n")
