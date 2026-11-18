@@ -79,6 +79,10 @@ class ReaderService : MediaBrowserService() {
     private var sectionFinished = false
     /** The device voice is reading a page that has no saved server audio (optional auto-switch). */
     private var deviceFallback = false
+    /** Gapless device-voice playback (RenderAhead); off for the session after it fails once. */
+    @Volatile private var renderer: RenderAhead? = null
+    private var renderFailed = false
+    private var pausedRenderer = false
     private val progressTick = object : Runnable {
         override fun run() {
             if (!playing) return
@@ -162,6 +166,7 @@ class ReaderService : MediaBrowserService() {
         }
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                if (utteranceId?.startsWith(RenderAhead.ID_PREFIX) == true) return
                 main.post {
                     val utterance = deviceQueue.firstOrNull()
                     if (playing && utterance != null && utterance.id == utteranceId) {
@@ -172,6 +177,7 @@ class ReaderService : MediaBrowserService() {
                 }
             }
             override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+                if (utteranceId?.startsWith(RenderAhead.ID_PREFIX) == true) return
                 main.post {
                     val utterance = deviceQueue.firstOrNull()
                     if (playing && utterance != null && utterance.id == utteranceId) {
@@ -182,15 +188,30 @@ class ReaderService : MediaBrowserService() {
                 }
             }
             override fun onDone(utteranceId: String?) {
+                if (rendered(utteranceId, true)) return
                 main.post { deviceDone(utteranceId) }
             }
             @Deprecated("Platform callback")
-            override fun onError(utteranceId: String?) { main.post { narrationError(utteranceId) } }
-            override fun onError(utteranceId: String?, errorCode: Int) {
+            override fun onError(utteranceId: String?) {
+                if (rendered(utteranceId, false)) return
                 main.post { narrationError(utteranceId) }
+            }
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                if (rendered(utteranceId, false)) return
+                main.post { narrationError(utteranceId) }
+            }
+            override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                rendered(utteranceId, false)
             }
         })
         if (playing && (store.narrationSource == "device" || deviceFallback)) speak()
+    }
+
+    /** Routes a TextToSpeech callback for a RenderAhead utterance (any thread). */
+    private fun rendered(utteranceId: String?, success: Boolean): Boolean {
+        if (utteranceId?.startsWith(RenderAhead.ID_PREFIX) != true) return false
+        renderer?.synthesisFinished(utteranceId, success)
+        return true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -223,10 +244,12 @@ class ReaderService : MediaBrowserService() {
             }
             "VOICE_CHANGED" -> {
                 networkVoiceFailed = false
+                renderFailed = false
                 if (playing) speak() else state()
             }
             "ENGINE_CHANGED" -> {
                 networkVoiceFailed = false
+                renderFailed = false
                 startTts()
                 if (!playing) state()
             }
@@ -281,6 +304,14 @@ class ReaderService : MediaBrowserService() {
 
     private fun pause(error: String? = null) {
         clearBriefPause()
+        val b = book
+        val reached = deviceChar
+        if (renderer != null && b != null && reached != null) {
+            // Gapless playback knows the piece being read: Play continues from it, not from the page start.
+            sections.getOrNull(b.section)?.pages?.getOrNull(b.page)?.let { page ->
+                resumeAt = PagePosition(b.section, b.page) to sentenceStart(page, reached)
+            }
+        }
         playing = false
         haltAudio()
         audioFocus.release()
@@ -296,7 +327,11 @@ class ReaderService : MediaBrowserService() {
         val position = PagePosition(b.section, b.page)
         pausedAt = position
         val player = cloudPlayer
-        if (player != null && !cloudLoading && runCatching { player.isPlaying }.getOrDefault(false)) {
+        val gapless = renderer
+        if (gapless != null) {
+            gapless.pause()
+            pausedRenderer = true
+        } else if (player != null && !cloudLoading && runCatching { player.isPlaying }.getOrDefault(false)) {
             player.pause()
             pausedPlayer = player
         } else {
@@ -318,9 +353,15 @@ class ReaderService : MediaBrowserService() {
         val b = book
         val player = pausedPlayer
         val samePage = b != null && pausedAt == PagePosition(b.section, b.page)
+        val gapless = renderer.takeIf { pausedRenderer }
         clearBriefPause(keepResumePoint = true)
         if (b == null) return
         playing = true
+        if (gapless != null && gapless === renderer && samePage) {
+            gapless.resume()
+            state()
+            return
+        }
         if (player != null && player === cloudPlayer && samePage) {
             val resumed = runCatching {
                 // Step back two seconds so the interrupted words are heard again.
@@ -338,6 +379,7 @@ class ReaderService : MediaBrowserService() {
         pausedBriefly = false
         pausedAt = null
         pausedPlayer = null
+        pausedRenderer = false
         if (!keepResumePoint) resumeAt = null
     }
 
@@ -451,6 +493,12 @@ class ReaderService : MediaBrowserService() {
         val current = PagePosition(b.section, b.page)
         val offset = resumeAt?.takeIf { it.first == current }?.second ?: 0
         resumeAt = null
+        if (!fallback && store.renderAhead && !renderFailed) {
+            startRenderer(current, offset, token)
+            hasNarrated = true
+            state()
+            return
+        }
         if (!queueDevice(current, token, TextToSpeech.QUEUE_FLUSH, offset)) {
             pause(tr("This voice could not start reading. Try another voice in Listening settings."))
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -459,6 +507,71 @@ class ReaderService : MediaBrowserService() {
         if (!fallback) queueNextDevice(token)
         hasNarrated = true
         state()
+    }
+
+    /** Starts gapless playback from [start] (character [offset] of that page) to the end of the book. */
+    private fun startRenderer(start: PagePosition, offset: Int, token: Int) {
+        renderer = RenderAhead(this, tts, renderChunks(start, offset), token, object : RenderAhead.Events {
+            override fun onChunkStarted(chunk: RenderAhead.Chunk) {
+                val b = book
+                if (token != generation || b == null) return
+                val position = PagePosition(chunk.section, chunk.page)
+                val pageChanged = position != PagePosition(b.section, b.page)
+                if (pageChanged) moveTo(position)
+                val length = sections.getOrNull(chunk.section)?.pages?.getOrNull(chunk.page)?.length ?: 1
+                pageStartedAt = SystemClock.elapsedRealtime()
+                deviceChar = chunk.start
+                deviceFraction = (chunk.start.toDouble() / length.coerceAtLeast(1)).coerceIn(0.0, 0.99)
+                if (pageChanged) state() else publishPlayback()
+            }
+            override fun onFinished() {
+                if (token == generation && playing) finishBook()
+            }
+            override fun onFailed(message: String) {
+                if (token != generation) return
+                android.util.Log.w("FolioTone", "Gapless playback failed ($message); using normal speech")
+                renderFailed = true
+                if (playing) speak()
+            }
+        }).start()
+    }
+
+    /** Text from [start]/[offset] to the end of the book, in pieces of a few sentences. */
+    private fun renderChunks(start: PagePosition, offset: Int): Iterator<RenderAhead.Chunk> = iterator {
+        var position: PagePosition? = start
+        var from = offset
+        var first = true
+        while (position != null) {
+            val page = sections[position.section].pages[position.page]
+            // The first piece of a session stays short, so playback starts quickly.
+            for ((pieceStart, text) in renderPieces(page, from.coerceIn(0, page.length), if (first) 160 else 350)) {
+                if (text.isBlank()) continue
+                yield(RenderAhead.Chunk(position.section, position.page, pieceStart, text))
+            }
+            first = false
+            from = 0
+            position = nextPosition(position)
+        }
+    }
+
+    /** Splits a page from [from] into pieces of whole sentences, about 350 characters ([firstLimit] for the first). */
+    private fun renderPieces(page: String, from: Int, firstLimit: Int): List<Pair<Int, String>> {
+        val pieces = mutableListOf<Pair<Int, String>>()
+        val ends = Regex("[.!?…;:»”\"]+\\s+|\\n+").findAll(page, from).map { it.range.last + 1 }.toList() + page.length
+        var pieceStart = from
+        var cursor = from
+        var limit = firstLimit
+        for (end in ends) {
+            if (end <= cursor) continue
+            if (end - pieceStart > limit && cursor > pieceStart) {
+                pieces += pieceStart to page.substring(pieceStart, cursor)
+                pieceStart = cursor
+                limit = 350
+            }
+            cursor = end
+        }
+        if (cursor > pieceStart) pieces += pieceStart to page.substring(pieceStart, cursor)
+        return pieces
     }
 
     private fun beginPlayback(): Boolean {
@@ -533,6 +646,9 @@ class ReaderService : MediaBrowserService() {
         deviceQueue.clear()
         completedDeviceIds.clear()
         deviceFallback = false
+        renderer?.stop()
+        renderer = null
+        pausedRenderer = false
         if (::tts.isInitialized) tts.stop()
     }
 

@@ -474,5 +474,7 @@
  "FolioTone closes and opens again on the new version.": "FolioTone se cierra y se abre de nuevo con la nueva versión.",
  "Download updates automatically": "Descargar actualizaciones automáticamente",
  "Off for builds from Android Studio; you can still check by hand.": "Desactivado en compilaciones de Android Studio; puedes buscar a mano.",
- "Checks GitHub twice a day; you confirm each install.": "Revisa GitHub dos veces al día; tú confirmas cada instalación."
+ "Checks GitHub twice a day; you confirm each install.": "Revisa GitHub dos veces al día; tú confirmas cada instalación.",
+ "Gapless playback": "Reproducción sin pausas",
+ "Prepares the next sentences and page in advance, so voices like SherpaTTS read without pauses.": "Prepara por adelantado las siguientes frases y la siguiente página, para que voces como SherpaTTS lean sin pausas."
 }
