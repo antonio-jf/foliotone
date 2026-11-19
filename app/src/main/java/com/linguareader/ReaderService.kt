@@ -84,6 +84,9 @@ class ReaderService : MediaBrowserService() {
     /** Gapless device-voice playback (RenderAhead); off for the session after it fails once. */
     @Volatile private var renderer: RenderAhead? = null
     private var lastSpokenStart = -1
+    /** Replay variant (1-3) for the page in [variantPage]; 0 = the normal way of splitting text. */
+    private var replayVariant = 0
+    private var variantPage: PagePosition? = null
     /** Gapless playback is waiting for the voice (reported as buffering, so the time doesn't run on). */
     private var rendererWaiting = false
     // Sleep timer: a wall-clock time, or the end of the current section.
@@ -539,6 +542,11 @@ class ReaderService : MediaBrowserService() {
         when {
             target != null -> {
                 val position = PagePosition(target.section, target.page)
+                // The voice gives the same audio for the same text, so each Replay on this page sends the
+                // text in another form: whole sentences, short clauses, then plain punctuation.
+                replayVariant = if (variantPage == position) replayVariant % 3 + 1 else 1
+                variantPage = position
+                Toast.makeText(this, tr("Replaying, version {0} of 3", replayVariant), Toast.LENGTH_SHORT).show()
                 clearBriefPause()
                 haltAudio()
                 if (position != PagePosition(b.section, b.page)) moveTo(position)
@@ -823,7 +831,11 @@ class ReaderService : MediaBrowserService() {
     private fun renderChunks(start: PagePosition, offset: Int): Iterator<RenderAhead.Chunk> {
         val language = NarrationVoices.locale(book?.language.orEmpty()).language
         val pages = sections
-        fun spoken(text: String) = SpeechText.normalize(text.trim(), language)
+        val variant = if (variantPage == start) replayVariant else 0
+        val plain = Regex("[^\\p{L}\\p{N}\\s.,;:!?'-]")
+        fun spoken(text: String) = SpeechText.normalize(text.trim(), language).let {
+            if (variant == 3) plain.replace(it, " ").replace(Regex("\\s+"), " ").trim() else it
+        }
         return iterator {
             var position: PagePosition? = start
             var from = offset
@@ -831,7 +843,7 @@ class ReaderService : MediaBrowserService() {
             while (true) {
                 val here = position ?: break
                 val page = pages[here.section].pages[here.page]
-                val sentences = renderSentences(page, from.coerceIn(0, page.length))
+                val sentences = renderSentences(page, from.coerceIn(0, page.length), if (here == start) variant else 0)
                 var index = 0
                 carry?.let { (carryPosition, unfinished) ->
                     val head = spoken(unfinished.text)
@@ -876,7 +888,7 @@ class ReaderService : MediaBrowserService() {
      * question or exclamation mark, a longer one for an ellipsis, and longer still for a paragraph break.
      * Abbreviations (Mr., Dr., Sra., initials) do not end a sentence.
      */
-    private fun renderSentences(page: String, from: Int): List<Sentence> {
+    private fun renderSentences(page: String, from: Int, variant: Int = 0): List<Sentence> {
         val pauseScale = store.pauseScale
         val sentences = mutableListOf<Sentence>()
         var cursor = from
@@ -899,7 +911,13 @@ class ReaderService : MediaBrowserService() {
             val complete = rest.trimEnd().lastOrNull()?.let { it in ".!?…»”\"'’)" } ?: true
             sentences += Sentence(cursor, rest, (SENTENCE_PAUSE_MS * pauseScale).toInt(), complete)
         }
-        return sentences.flatMap { splitLong(it) }
+        return sentences.flatMap {
+            when (variant) {
+                1 -> listOf(it)                 // Replay 1: whole sentences
+                2 -> splitLong(it, 60, 45)      // Replay 2: short clauses
+                else -> splitLong(it)
+            }
+        }
     }
 
     /**
@@ -908,16 +926,16 @@ class ReaderService : MediaBrowserService() {
      * slow down more than proportionally on long input: on a test phone 20 characters rendered in 0.7 s,
      * but a 219-character sentence took over 16 s, longer than it takes to hear.
      */
-    private fun splitLong(sentence: Sentence): List<Sentence> {
+    private fun splitLong(sentence: Sentence, maxLength: Int = CLAUSE_LIMIT, target: Int = CLAUSE_TARGET): List<Sentence> {
         val text = sentence.text
-        if (text.length <= CLAUSE_LIMIT) return listOf(sentence)
+        if (text.length <= maxLength) return listOf(sentence)
         val cuts = CLAUSE_END.findAll(text).map { it.range.last + 1 }.toMutableList()
         val parts = mutableListOf<Pair<Int, Int>>()
         var partStart = 0
-        while (text.length - partStart > CLAUSE_LIMIT) {
-            val limit = partStart + CLAUSE_TARGET
+        while (text.length - partStart > maxLength) {
+            val limit = partStart + target
             var cut = cuts.lastOrNull { it in (partStart + 20)..limit }
-                ?: cuts.firstOrNull { it in (limit + 1)..(partStart + CLAUSE_LIMIT) }
+                ?: cuts.firstOrNull { it in (limit + 1)..(partStart + maxLength) }
             if (cut == null) {
                 // No clause boundary nearby: cut at the last space before the target.
                 cut = text.lastIndexOf(' ', limit).takeIf { it > partStart + 20 }?.plus(1) ?: break
