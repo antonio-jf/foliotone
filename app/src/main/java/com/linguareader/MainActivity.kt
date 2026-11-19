@@ -68,6 +68,9 @@ class MainActivity : Activity() {
     private var inSettings = false
     /** Full-screen reading: only the page and a slim control row. */
     private var focusMode = false
+    /** Home search text (kept while the screen is redrawn) and its field. */
+    private var librarySearch = ""
+    private var homeSearch: EditText? = null
     /** The reading page on screen and the part of it being narrated (highlighted). */
     private var pageView: TextView? = null
     private var pageKey: Triple<String, Int, Int>? = null
@@ -811,45 +814,45 @@ class MainActivity : Activity() {
             libraryControls.addView(viewToggle(tr("Grid"), true), LinearLayout.LayoutParams(dp(64), -2))
             content.addView(libraryControls)
             gap(10)
-            val visible = sortedLibrary(books.filter { book ->
-                val read = store.isRead(book.id)
-                when (store.libraryFilterChoice) {
-                    1 -> !read && (book.section > 0 || book.page > 0)
-                    2 -> !read && book.section == 0 && book.page == 0
-                    3 -> read
-                    4 -> runCatching { NarrationLibrary.badge(this, book) }.getOrNull() != null
-                    else -> true
+            val searchField = EditText(this).apply {
+                hint = tr("Search your books")
+                setText(librarySearch)
+                setSingleLine(true)
+                inputType = InputType.TYPE_CLASS_TEXT
+                imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                setTextColor(ink); setHintTextColor(muted)
+                textSize = 15f
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                background = rounded(surface, 14)
+                contentDescription = tr("Search your books by title or author")
+            }
+            content.addView(searchField, LinearLayout.LayoutParams(-1, -2))
+            homeSearch = searchField
+            gap(10)
+            // Only the results are redrawn while typing, so the field keeps focus and the keyboard stays.
+            val results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            content.addView(results)
+            val widthDp = (resources.displayMetrics.widthPixels - scroll.paddingLeft - scroll.paddingRight -
+                content.paddingLeft - content.paddingRight) / resources.displayMetrics.density
+            fun fill() {
+                val outer = content
+                content = results
+                try { results.removeAllViews(); renderLibrary(books, filters, widthDp) } finally { content = outer }
+            }
+            fill()
+            searchField.addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    if (librarySearch == s?.toString().orEmpty()) return
+                    librarySearch = s?.toString().orEmpty()
+                    fill()
                 }
             })
-            if (visible.isEmpty()) addText(tr("No books match “{0}”.", filters[store.libraryFilterChoice]), 14f, muted)
-            if (store.libraryGrid) showLibraryGrid(visible)
-            else visible.forEach { book ->
-                val bookRow = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(11), dp(10), dp(11), dp(10))
-                    background = rounded(surface, 15)
-                    addView(poster(book, 59, 83))
-                    val details = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-                    details.addView(text(book.title, 18f).apply { typeface = Typeface.SERIF; maxLines = 2 })
-                    details.addView(text(book.author.ifBlank { tr("Unknown author") }, 12f, muted).apply { maxLines = 1 },
-                        LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
-                    details.addView(text(tr("Section {0} · {1}%", book.section + 1, progress(book)), 12f, accent),
-                        LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(9) })
-                    store.rating(book.id)?.let { score ->
-                        details.addView(text("★ ${ratingScore(score)} / 5.0", 12f, accent),
-                            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
-                    }
-                    details.addView(text(if (store.isRead(book.id)) tr("✓ Read") else tr("Unread"), 12f, muted),
-                        LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
-                    narrationBadge(book)?.let { details.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) }) }
-                    addView(details, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(13) })
-                    addView(text("›", 30f, muted), LinearLayout.LayoutParams(-2, -2))
-                    isClickable = true; isFocusable = true
-                    setOnClickListener { openBook(book) }
-                    setOnLongClickListener { bookStatusOptions(book); true }
-                }
-                content.addView(bookRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(9) })
+            searchField.setOnEditorActionListener { view, _, _ ->
+                (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                    .hideSoftInputFromWindow(view.windowToken, 0)
+                view.clearFocus(); true
             }
         }
         gap(17)
@@ -880,7 +883,60 @@ class MainActivity : Activity() {
             }
         }
 
+    /** The library list or grid for the current filter, sort and search text. */
+    private fun renderLibrary(books: List<Book>, filters: List<String>, widthDp: Float) {
+        val words = foldForSearch(librarySearch).split(Regex("\\s+")).filter { it.isNotBlank() }
+        val visible = sortedLibrary(books.filter { book ->
+            val haystack = foldForSearch("${book.title} ${book.author}")
+            if (words.any { it !in haystack }) return@filter false
+            val read = store.isRead(book.id)
+            when (store.libraryFilterChoice) {
+                1 -> !read && (book.section > 0 || book.page > 0)
+                2 -> !read && book.section == 0 && book.page == 0
+                3 -> read
+                4 -> runCatching { NarrationLibrary.badge(this, book) }.getOrNull() != null
+                else -> true
+            }
+        })
+        if (visible.isEmpty()) addText(if (words.isNotEmpty()) tr("No books match “{0}”.", librarySearch.trim())
+            else tr("No books match “{0}”.", filters[store.libraryFilterChoice]), 14f, muted)
+        if (store.libraryGrid) showLibraryGrid(visible, widthDp)
+        else visible.forEach { book ->
+            val bookRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(11), dp(10), dp(11), dp(10))
+                background = rounded(surface, 15)
+                addView(poster(book, 59, 83))
+                val details = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                details.addView(text(book.title, 18f).apply { typeface = Typeface.SERIF; maxLines = 2 })
+                details.addView(text(book.author.ifBlank { tr("Unknown author") }, 12f, muted).apply { maxLines = 1 },
+                    LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
+                details.addView(text(tr("Section {0} · {1}%", book.section + 1, progress(book)), 12f, accent),
+                    LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(9) })
+                store.rating(book.id)?.let { score ->
+                    details.addView(text("★ ${ratingScore(score)} / 5.0", 12f, accent),
+                        LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
+                }
+                details.addView(text(if (store.isRead(book.id)) tr("✓ Read") else tr("Unread"), 12f, muted),
+                    LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) })
+                narrationBadge(book)?.let { details.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5) }) }
+                addView(details, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(13) })
+                addView(text("›", 30f, muted), LinearLayout.LayoutParams(-2, -2))
+                isClickable = true; isFocusable = true
+                setOnClickListener { openBook(book) }
+                setOnLongClickListener { bookStatusOptions(book); true }
+            }
+            content.addView(bookRow, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(9) })
+        }
+    }
+
+    /** Lower case without accents, for matching typed text. */
+    private fun foldForSearch(value: String) =
+        java.text.Normalizer.normalize(value.lowercase(), java.text.Normalizer.Form.NFD).replace(Regex("\\p{M}"), "")
+
     private fun refreshHome() {
+        if (homeSearch?.hasFocus() == true) return // don't pull the field away while typing
         val position = scroll.scrollY
         showHome()
         scroll.post { scroll.scrollTo(0, position) }
@@ -894,9 +950,8 @@ class MainActivity : Activity() {
         scroll.post { scroll.scrollTo(0, position) }
     }
 
-    private fun showLibraryGrid(books: List<Book>) {
-        val widthDp = (resources.displayMetrics.widthPixels - scroll.paddingLeft - scroll.paddingRight -
-            content.paddingLeft - content.paddingRight) / resources.displayMetrics.density
+    private fun showLibraryGrid(books: List<Book>, widthDp: Float = (resources.displayMetrics.widthPixels -
+            scroll.paddingLeft - scroll.paddingRight - content.paddingLeft - content.paddingRight) / resources.displayMetrics.density) {
         val columns = (widthDp / 150).toInt().coerceIn(if (widthDp >= 260) 2 else 1, 5)
         val cardWidth = ((widthDp - (columns - 1) * 10) / columns).toInt()
         val coverWidth = (cardWidth - 24).coerceAtLeast(40)
