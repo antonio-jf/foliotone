@@ -268,7 +268,12 @@ class ReaderService : MediaBrowserService() {
                 val id = intent.getStringExtra("id") ?: return START_STICKY
                 if (book?.id == id) state() else open(id, null, false, false)
             }
-            "PLAY" -> play()
+            "PLAY" -> {
+                // Android may have stopped this service while paused, losing the loaded book.
+                // The reader names its book so playback never falls back to a different one.
+                val id = intent.getStringExtra("id")
+                if (id != null && book?.id != id) open(id, null, false, true) else play()
+            }
             "REPLAY" -> replay()
             "BACK15" -> rewind(15)
             "REPORT" -> reportSentence()
@@ -353,7 +358,8 @@ class ReaderService : MediaBrowserService() {
     private fun play() {
         if (pausedBriefly) { main.removeCallbacks(resumeAfterInterruption); resumeBriefly(); return }
         if (book == null) {
-            val recent = store.books().firstOrNull() ?: return
+            // After a restart, resume the book last opened, not the first one in the library.
+            val recent = store.recentBooks(1).firstOrNull() ?: store.books().firstOrNull() ?: return
             open(recent.id, null, false, true)
             return
         }

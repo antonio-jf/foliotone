@@ -595,6 +595,11 @@ class MainActivity : Activity() {
                 FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { setMargins(dp(14), 0, dp(10), dp(10)) })
         }
     }
+    /** Names the book on screen, so a service restarted by Android plays this book and not another one. */
+    private fun playBook() {
+        val id = selectedId
+        if (id == null) command("PLAY") else command("PLAY", "id" to id)
+    }
     private fun command(action: String, vararg extras: Pair<String, Any>) {
         val intent = Intent(this, ReaderService::class.java).setAction(action)
         extras.forEach { (key, value) -> when (value) {
@@ -2316,7 +2321,7 @@ class MainActivity : Activity() {
         chapter.addView(seek, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         content.addView(chapter)
         gap(10)
-        val listen = compact(button(playbackLabel()) { command(if (playing) "PAUSE" else "PLAY") }, 44)
+        val listen = compact(button(playbackLabel()) { if (playing) command("PAUSE") else playBook() }, 44)
         playbackButton = listen
         content.addView(rowOf(compact(secondary(tr("◀  Back")) { command("PREVIOUS") }, 44),
             compact(secondary(tr("⟲ 15 s")) { command("BACK15") }, 44).apply { contentDescription = tr("Back 15 seconds") },
@@ -2395,7 +2400,7 @@ class MainActivity : Activity() {
     /** Full-screen reading: page text with a slim control row. */
     private fun showFocusReader(book: Book, sectionIndex: Int, pageIndex: Int, page: String) {
         content.removeAllViews()
-        val listen = compact(button(playbackLabel()) { command(if (playing) "PAUSE" else "PLAY") }, 40)
+        val listen = compact(button(playbackLabel()) { if (playing) command("PAUSE") else playBook() }, 40)
         playbackButton = listen
         content.addView(rowOf(compact(secondary(tr("✕")) { focusMode = false; showReader() }, 40).apply {
                 contentDescription = tr("Leave full screen")
