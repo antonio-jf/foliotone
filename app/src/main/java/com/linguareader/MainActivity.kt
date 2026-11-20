@@ -725,19 +725,29 @@ class MainActivity : Activity() {
             showSettings()
         }, LinearLayout.LayoutParams(-2, -2))
         content.addView(header)
-        gap(22)
-        content.addView(button(tr("＋  Add a book")) {
+        gap(16)
+        content.addView(compact(button(tr("＋  Add a book")) {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE); type = "application/epub+zip"
                 putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/epub+zip", "application/octet-stream"))
             }, importRequest)
-        }, LinearLayout.LayoutParams(-1, -2))
-        content.addView(secondary(tr("Browse Project Gutenberg")) { openGutenberg() },
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
-        content.addView(secondary(tr("★  Ratings & best books")) { ratingsFilter = 0; showRatings() },
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
-        content.addView(secondary(tr("Themes · {0}", palette.name)) { chooseTheme() },
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        }, 44).apply { textSize = 14f }, LinearLayout.LayoutParams(-1, -2))
+        // Secondary actions share one row so the library starts higher on the screen.
+        content.addView(rowOf(
+            compact(secondary(tr("Gutenberg")) { openGutenberg() }).apply {
+                contentDescription = tr("Browse Project Gutenberg")
+            },
+            compact(secondary(tr("★  Ratings")) { ratingsFilter = 0; showRatings() }).apply {
+                contentDescription = tr("★  Ratings & best books")
+            },
+            compact(secondary(tr("Themes")) { chooseTheme() }).apply {
+                contentDescription = tr("Themes · {0}", palette.name)
+            }
+        ).apply {
+            for (i in 0 until childCount) (getChildAt(i) as TextView).apply {
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            }
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         GutenbergDownloadService.progressText?.takeIf { GutenbergDownloadService.activeId != null }
             ?.let {
                 val status = text(it, 12f, accent)
