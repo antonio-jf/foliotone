@@ -73,6 +73,10 @@ class MainActivity : Activity() {
     private var homeSearch: EditText? = null
     /** The reading page on screen and the part of it being narrated (highlighted). */
     private var pageView: TextView? = null
+    /** The narrated-sentence highlight on [pageView], changed in place so a text selection survives it. */
+    private var spokenSpanColor = 0
+    /** A redraw that arrived while the reader had text selected; it runs once the selection ends. */
+    private var redrawAfterSelection = false
     private var pageKey: Triple<String, Int, Int>? = null
     private var spokenRange: Pair<Triple<String, Int, Int>, IntRange>? = null
     private val spokenReceiver = object : BroadcastReceiver() {
@@ -83,7 +87,7 @@ class MainActivity : Activity() {
             if (start < 0) {
                 // Playback restarted or can't follow the text: drop the highlight.
                 spokenRange = null
-                pageView?.let { it.text = it.text.toString() }
+                (pageView?.text as? android.text.Spannable)?.removeSpan(currentSpokenSpan())
                 return
             }
             spokenRange = key to (start until intent.getIntExtra("end", 0))
@@ -144,7 +148,10 @@ class MainActivity : Activity() {
                 sessionPage = intent?.getIntExtra("page", 0)
             }
             intent?.getStringExtra("error")?.let(::toast)
-            if (selectedId != null && !inSettings && !busy && !opening) showReader()
+            // Redrawing replaces the page text, which would drop a selection the reader is making.
+            if (selectedId != null && !inSettings && !busy && !opening && pageView?.hasSelection() == true)
+                redrawAfterSelection = true
+            else if (selectedId != null && !inSettings && !busy && !opening) showReader()
             else if (selectedId == null && !inSettings && !browsingGutenberg && !browsingRatings && !opening) {
                 // The home screen shows positions; redraw it when narration has moved past them.
                 val id = intent?.getStringExtra("id")
@@ -2358,7 +2365,8 @@ class MainActivity : Activity() {
 
     /**
      * The page text: sized from the reading settings, the sentence being narrated highlighted, and a tap
-     * on a sentence reads from there.
+     * on a sentence reads from there. A long press selects text for Copy, Share, Translate and other
+     * apps' text tools, plus Listen from here.
      */
     private fun readingPage(book: Book, sectionIndex: Int, pageIndex: Int, page: String): TextView {
         val view = text(page, store.readerTextSize, palette.paperInk).apply {
@@ -2367,11 +2375,35 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(18), dp(16), dp(20))
             background = rounded(palette.paper, 16)
             isClickable = true
-            contentDescription = tr("Reading page. Tap a sentence to read from there.")
+            contentDescription = tr("Reading page. Tap a sentence to read from there. Long-press to select text.")
+            setTextIsSelectable(true)
+            highlightColor = (accent and 0x00FFFFFF) or 0x55000000
+        }
+        val listenFromHere = android.view.Menu.FIRST + 100
+        view.customSelectionActionModeCallback = object : android.view.ActionMode.Callback {
+            override fun onCreateActionMode(mode: android.view.ActionMode, menu: android.view.Menu): Boolean {
+                menu.add(android.view.Menu.NONE, listenFromHere, 0, tr("Listen from here"))
+                return true
+            }
+            override fun onPrepareActionMode(mode: android.view.ActionMode, menu: android.view.Menu) = false
+            override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem): Boolean {
+                if (item.itemId != listenFromHere) return false
+                val start = view.selectionStart.coerceAtLeast(0)
+                mode.finish()
+                command("READ_FROM", "section" to sectionIndex, "page" to pageIndex, "char" to start)
+                return true
+            }
+            override fun onDestroyActionMode(mode: android.view.ActionMode) {
+                if (!redrawAfterSelection) return
+                redrawAfterSelection = false
+                view.post { if (selectedId != null && !inSettings && !busy && !opening) showReader() }
+            }
         }
         val tap = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: android.view.MotionEvent) = true
             override fun onSingleTapUp(e: android.view.MotionEvent): Boolean {
+                // A tap while text is selected only clears the selection.
+                if (view.hasSelection()) return false
                 val offset = view.getOffsetForPosition(e.x, e.y)
                 if (offset < 0) return false
                 command("READ_FROM", "section" to sectionIndex, "page" to pageIndex, "char" to offset)
@@ -2390,13 +2422,14 @@ class MainActivity : Activity() {
         val view = pageView ?: return
         val (key, range) = spokenRange ?: return
         if (key != pageKey) return
-        val text = view.text.toString()
-        val start = range.first.coerceIn(0, text.length)
-        val end = (range.last + 1).coerceIn(start, text.length)
-        val styled = android.text.SpannableString(text)
-        if (end > start) styled.setSpan(android.text.style.BackgroundColorSpan((accent and 0x00FFFFFF) or 0x40000000),
-            start, end, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-        view.text = styled
+        val styled = view.text as? android.text.Spannable
+            ?: android.text.SpannableString(view.text).also { view.setText(it, TextView.BufferType.SPANNABLE) }
+        val start = range.first.coerceIn(0, styled.length)
+        val end = (range.last + 1).coerceIn(start, styled.length)
+        // Moving one span keeps the text object, so a selection in progress is not cleared.
+        val span = currentSpokenSpan()
+        styled.removeSpan(span)
+        if (end > start) styled.setSpan(span, start, end, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         if (!scrollTo || end <= start) return
         val layout = view.layout ?: return
         val lineTop = view.top + view.paddingTop + layout.getLineTop(layout.getLineForOffset(start))
@@ -2405,6 +2438,17 @@ class MainActivity : Activity() {
         if (lineTop < visibleTop + dp(40) || lineTop > visibleBottom - dp(120)) {
             scroll.smoothScrollTo(0, (lineTop - scroll.height / 3).coerceAtLeast(0))
         }
+    }
+
+    /** The highlight span in the current theme's accent; a theme change gets a new span. */
+    private var spokenSpanInstance = android.text.style.BackgroundColorSpan(0)
+    private fun currentSpokenSpan(): android.text.style.BackgroundColorSpan {
+        val color = (accent and 0x00FFFFFF) or 0x40000000
+        if (color != spokenSpanColor) {
+            (pageView?.text as? android.text.Spannable)?.removeSpan(spokenSpanInstance)
+            spokenSpanInstance = android.text.style.BackgroundColorSpan(color); spokenSpanColor = color
+        }
+        return spokenSpanInstance
     }
 
     /** Full-screen reading: page text with a slim control row. */
